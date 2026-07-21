@@ -1,78 +1,154 @@
+"""
+GD-PINNs: Graph-Diffusion Physics-Informed Neural Networks
+Reference: "A spectral-physical manifold for scalable knowledge transfer in partial differential equation families"
+Description: End-to-end pipeline including Cartesian resampling, 3D spectral feature extraction,
+             manifold-conditioned architecture (FiLM), and graph-guided decoupled transfer.
+"""
+
+import argparse
+import os
+import glob
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.autograd as autograd
 import torch.optim as optim
-import numpy as np
-import os
-import glob
-import copy
 from torch.optim import LBFGS
-from sklearn.preprocessing import MinMaxScaler
-from scipy.fft import fft
-from scipy.signal import welch
+from scipy.interpolate import griddata
+from scipy.fft import fftn, fftshift
 
 # PyG Imports
-import torch_geometric
-from torch_geometric.nn import GCNConv, GATConv, SAGEConv
-from torch_geometric.data import Data
+from torch_geometric.nn import GATConv
 
 
-# 1. 基础物理模型 (VPNSFnet)
-class MLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.block1 = nn.Sequential(
-            nn.Linear(3, 120), nn.Tanh(),
-            nn.Linear(120, 120), nn.Tanh(),
-            nn.Linear(120, 120), nn.Tanh()
-        )
-        self.block2 = nn.Sequential(
-            nn.Linear(120, 120), nn.Tanh(),
-            nn.Linear(120, 120), nn.Tanh()
-        )
-        self.output = nn.Linear(120, 4)
+# =============================================================================
+# 1. Data Preprocessing & Cartesian Resampling
+# Ref: Supplementary Note 2.2
+# =============================================================================
+def nondimensionalize_coordinates(coords):
+    """Maps spatial coordinates to [-1, 1]^3 for active tanh gradients."""
+    coords_min = np.min(coords, axis=0)
+    l_ref = np.max(np.max(coords, axis=0) - coords_min)
+    coords_norm = 2.0 * (coords - coords_min) / l_ref - 1.0
+    return np.clip(coords_norm, -1.0, 1.0)
 
-    def forward(self, x):
-        h1 = self.block1(x)
-        h2 = self.block2(h1)
-        return self.output(h2)
 
-class VPNSFnet(nn.Module):
+def cartesian_resampling(coords_norm, physical_fields, resolution=32):
     """
-    Navier-Stokes Physics-Informed Neural Network
-    Inputs: (x, y, z)
-    Outputs: (u, v, w, p)
+    Interpolates unstructured data onto a unified 3D Cartesian grid.
+    This eliminates mesh-dependent artifacts for subsequent 3D FFT.
     """
+    grid_1d = np.linspace(-1.0, 1.0, resolution)
+    grid_x, grid_y, grid_z = np.meshgrid(grid_1d, grid_1d, grid_1d, indexing='ij')
+    target_points = np.vstack((grid_x.flatten(), grid_y.flatten(), grid_z.flatten())).T
 
-    def __init__(self, Re=229.1451):
+    num_channels = physical_fields.shape[1]
+    structured_fields = np.zeros((target_points.shape[0], num_channels))
+
+    for c in range(num_channels):
+        # Linear interpolation preserves dominant low-frequency F-principle structures
+        interpolated_c = griddata(coords_norm, physical_fields[:, c], target_points, method='linear')
+        if np.isnan(interpolated_c).any():
+            nearest_c = griddata(coords_norm, physical_fields[:, c], target_points, method='nearest')
+            interpolated_c = np.where(np.isnan(interpolated_c), nearest_c, interpolated_c)
+        structured_fields[:, c] = interpolated_c
+
+    return structured_fields.reshape((resolution, resolution, resolution, num_channels))
+
+
+# =============================================================================
+# 2. 3D Spectral-Physical Feature Extraction
+# Ref: Main Text Section 4.1 & Supplementary Note 2.4
+# =============================================================================
+class SpectralPhysicalExtractor:
+    def __init__(self, d_pod=10, d_psd=60, d_fft=80):
+        self.d_pod = d_pod
+        self.d_psd = d_psd
+        self.d_fft = d_fft
+
+    def compute_features(self, tensor_3d):
+        """Extracts 150-dimensional physical manifold coordinates from structured 3D tensors."""
+        fft_features = []
+        for c in range(4):  # u, v, w, p
+            fft_3d = np.abs(fftn(tensor_3d[..., c]))
+            fft_3d = fftshift(fft_3d)
+            center = np.array(fft_3d.shape) // 2
+            sub_vol = fft_3d[center[0] - 2:center[0] + 3, center[1] - 2:center[1] + 3, center[2] - 2:center[2] + 3]
+            top_modes = np.sort(sub_vol.flatten())[::-1][:20]
+            fft_features.extend(top_modes / (np.sum(top_modes) + 1e-8))
+
+        psd_features = []
+        for axis in range(3):
+            axis_energy = np.sum(tensor_3d[..., 0] ** 2 + tensor_3d[..., 1] ** 2 + tensor_3d[..., 2] ** 2,
+                                 axis=tuple([i for i in range(3) if i != axis]))
+            psd_1d = np.abs(np.fft.fft(axis_energy))[:20]
+            psd_1d = np.pad(psd_1d, (0, max(0, 20 - len(psd_1d))))[:20]
+            psd_features.extend(psd_1d / (np.sum(psd_1d) + 1e-8))
+
+        snapshot_matrix = tensor_3d.reshape(-1, 4)
+        try:
+            _, S, _ = np.linalg.svd(snapshot_matrix, full_matrices=False)
+            energy = S ** 2
+            pod_features = (energy / np.sum(energy))[:self.d_pod]
+        except np.linalg.LinAlgError:
+            pod_features = np.ones(self.d_pod) / self.d_pod
+        pod_features = np.pad(pod_features, (0, max(0, self.d_pod - len(pod_features))))
+
+        z_i = np.concatenate([fft_features, psd_features, pod_features])
+        return z_i
+
+
+# =============================================================================
+# 3. Manifold-Conditioned Operator-Geometry Architecture
+# Ref: Main Text Section 4.3 & Supplementary Note 2.3
+# =============================================================================
+class GD_PINNs_Net(nn.Module):
+    def __init__(self, Re=229.1451, graph_emb_dim=64):
         super().__init__()
-        self.model = MLP()
         self.Re = Re
 
-    def forward(self, x):
-        return self.model(x)
+        # Locally Inherited Operator Encoder (Invariant Block) - Width 100
+        self.encoder = nn.Sequential(
+            nn.Linear(3, 100), nn.Tanh(),
+            nn.Linear(100, 100), nn.Tanh(),
+            nn.Linear(100, 100), nn.Tanh(),
+            nn.Linear(100, 100), nn.Tanh()
+        )
 
-    def net_NS(self, x):
-        return self.forward(x)
+        # FiLM Generator (Eq. 21) - Maps graph embedding to scaling & shifting coefficients
+        self.film_mlp = nn.Sequential(
+            nn.Linear(graph_emb_dim, 100), nn.ReLU(),
+            nn.Linear(100, 200)  # Output 100 for gamma, 100 for beta
+        )
 
-    def net_f_NS(self, x):
-        """
-        Calculates PDE residuals for Navier-Stokes equations.
-        Ref: Eq. (1) in paper[cite: 47, 48].
-        """
+        # Geometric Manifold Adapter (Variant Block) - Width 100
+        self.adapter = nn.Sequential(
+            nn.Linear(100, 100), nn.Tanh(),
+            nn.Linear(100, 100), nn.Tanh(),
+            nn.Linear(100, 4)  # u, v, w, p
+        )
+
+    def forward(self, x, h_graph):
+        latent_features = self.encoder(x)
+        film_params = self.film_mlp(h_graph)
+        gamma = film_params[:, :100]
+        beta = film_params[:, 100:]
+
+        # Feature-wise Linear Modulation
+        modulated_features = gamma * latent_features + beta
+        return self.adapter(modulated_features)
+
+    def net_f_NS(self, x, h_graph):
         x = x.clone().detach().requires_grad_(True)
-        uvwp = self.forward(x)
+        uvwp = self.forward(x, h_graph)
         u, v, w, p = uvwp[:, 0:1], uvwp[:, 1:2], uvwp[:, 2:3], uvwp[:, 3:4]
 
         def grads(y):
-            return autograd.grad(y, x, torch.ones_like(y), create_graph=True, retain_graph=True)[0]
+            return autograd.grad(y, x, torch.ones_like(y), create_graph=True)[0]
 
-        u_grads = grads(u)
-        v_grads = grads(v)
-        w_grads = grads(w)
-        p_grads = grads(p)
-
+        u_grads, v_grads, w_grads, p_grads = grads(u), grads(v), grads(w), grads(p)
         u_x, u_y, u_z = u_grads[:, 0:1], u_grads[:, 1:2], u_grads[:, 2:3]
         v_x, v_y, v_z = v_grads[:, 0:1], v_grads[:, 1:2], v_grads[:, 2:3]
         w_x, w_y, w_z = w_grads[:, 0:1], w_grads[:, 1:2], w_grads[:, 2:3]
@@ -87,440 +163,187 @@ class VPNSFnet(nn.Module):
         f_u = u * u_x + v * u_y + w * u_z + p_x - inv_Re * (u_xx + u_yy + u_zz)
         f_v = u * v_x + v * v_y + w * v_z + p_y - inv_Re * (v_xx + v_yy + v_zz)
         f_w = u * w_x + v * w_y + w * w_z + p_z - inv_Re * (w_xx + w_yy + w_zz)
+
         return uvwp, f_u, f_v, f_w, f_e
 
 
-# 2. 频谱特征提取 (Spectral Feature Extraction) - 保持不变
-class SpectralFeatureExtractor:
-
-    def __init__(self, n_freq_bins=20, n_pod_modes=10):
-        self.n_freq_bins = n_freq_bins
-        self.n_pod_modes = n_pod_modes
-
-    def compute_spectral_features(self, data):
-        input_features = []
-        for i in range(3):
-            signal = data[:, i]
-            freqs, psd = welch(signal, nperseg=min(256, len(signal)))
-            if len(psd) > self.n_freq_bins:
-                psd = psd[:self.n_freq_bins]
-            else:
-                psd = np.pad(psd, (0, self.n_freq_bins - len(psd)))
-            input_features.extend(psd)
-
-        output_features = []
-        for i in range(3, 7):
-            signal = data[:, i]
-            fft_vals = np.abs(fft(signal))
-            fft_vals = fft_vals[:len(fft_vals) // 2]
-            if len(fft_vals) > self.n_freq_bins:
-                fft_vals = fft_vals[:self.n_freq_bins]
-            else:
-                fft_vals = np.pad(fft_vals, (0, self.n_freq_bins - len(fft_vals)))
-
-            if np.sum(fft_vals) > 0:
-                fft_vals = fft_vals / np.sum(fft_vals)
-            output_features.extend(fft_vals)
-
-        pod_features = self.compute_pod_spectrum(data[:, 3:7])
-
-        expected_dim = self.n_freq_bins * 3 + self.n_freq_bins * 4 + self.n_pod_modes
-        all_features = input_features + output_features + pod_features.tolist()
-
-        # Dimension alignment
-        if len(all_features) > expected_dim:
-            all_features = all_features[:expected_dim]
-        elif len(all_features) < expected_dim:
-            all_features = all_features + [0.0] * (expected_dim - len(all_features))
-
-        return np.array(all_features)
-
-    def compute_pod_spectrum(self, output_data, K=10):
-        try:
-            U, S, Vt = np.linalg.svd(output_data, full_matrices=False)
-            energy = S ** 2
-            if energy.sum() > 0:
-                energy = energy / energy.sum()
-            else:
-                energy = np.ones(len(S)) / len(S)
-        except:
-            energy = np.ones(K) / K
-
-        if len(energy) < K:
-            energy = np.pad(energy, (0, K - len(energy)))
-        return energy[:K]
-
-
-# 3. GNN 网络结构 (StructureAwareGNN)
-class StructureAwareGNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128, output_dim=64, heads=8):
+# =============================================================================
+# 4. Graph Architecture & Knowledge Network
+# Ref: Supplementary Note 2.5
+# =============================================================================
+class ManifoldGNN(nn.Module):
+    def __init__(self, input_dim=150, hidden_dim=128, output_dim=64, heads=4):
         super().__init__()
         self.gat1 = GATConv(input_dim, hidden_dim, heads=heads, concat=True)
-        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=4, concat=True)
-        self.gat3 = GATConv(hidden_dim * 4, hidden_dim, heads=1, concat=False)
-        self.sage = SAGEConv(hidden_dim, hidden_dim)
-
-        predictor_input_dim = (hidden_dim * heads) + (hidden_dim * 4) + hidden_dim
-        self.transfer_predictor = nn.Sequential(
-            nn.Linear(predictor_input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-        self.edge_predictor = nn.Sequential(
-            nn.Linear(output_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
-        )
+        self.gat2 = GATConv(hidden_dim * heads, output_dim, heads=1, concat=False)
 
     def forward(self, x, edge_index, edge_weight=None):
-        x1 = F.elu(self.gat1(x, edge_index, edge_weight))
-        x2 = F.elu(self.gat2(x1, edge_index, edge_weight))
-        x3 = F.elu(self.gat3(x2, edge_index, edge_weight))
-        x_sage = F.elu(self.sage(x3, edge_index))
-
-        x1_mean = x1.mean(dim=0, keepdim=True).expand(x3.size(0), -1)
-        x2_mean = x2.mean(dim=0, keepdim=True).expand(x3.size(0), -1)
-        x_combined = torch.cat([x1_mean, x2_mean, x_sage], dim=1)
-
-        return self.transfer_predictor(x_combined)
-
-    def predict_edge_weights(self, node_embeddings, edge_index):
-        src, dst = edge_index
-        src_emb, dst_emb = node_embeddings[src], node_embeddings[dst]
-        edge_features = torch.cat([src_emb, dst_emb], dim=1)
-        return self.edge_predictor(edge_features).squeeze()
+        x = F.leaky_relu(self.gat1(x, edge_index, edge_weight), negative_slope=0.2)
+        x = F.leaky_relu(self.gat2(x, edge_index, edge_weight), negative_slope=0.2)
+        return x
 
 
-# 4. 知识图谱核心逻辑 (AdvancedKnowledgeNetwork)
 class AdvancedKnowledgeNetwork:
-    """
-    Manages graph construction, GNN training, and RWR-based transfer weighting.
-    Fixes:
-    1. Adds self-supervised GNN training (Learning Gap)[cite: 504, 505].
-    2. Implements Random Walk with Restart for multi-hop weights (Logic Gap).
-    """
-
-    def __init__(self, input_dim, device, k_neighbors=30, hidden_dim=128, output_dim=64):
+    def __init__(self, device, k_neighbors=5, output_dim=64):
         self.device = device
-        self.k_neighbors_graph_build = k_neighbors
-        # GNN is now a trainable module
-        self.gnn = StructureAwareGNN(input_dim, hidden_dim, output_dim).to(device)
-        self.edge_index = None
-        self.edge_weights = None
+        self.k_neighbors = k_neighbors
+        self.gnn = ManifoldGNN(output_dim=output_dim).to(device)
         self.task_embeddings = None
-        self.dense_adj = None  # Added for RWR and Training
-        self.raw_features = None  # Store for training loop
 
-    def build_sparse_knowledge_graph(self, spectral_features):
-        """Constructs the graph and prepares for GNN training."""
-        print("Building Spectral-Physical Graph...")
-        features_tensor = torch.tensor(np.array(spectral_features), dtype=torch.float32).to(self.device)
-        self.raw_features = features_tensor  # Save for training
+    def build_and_train_graph(self, features, epochs=200):
+        print("[Graph] Constructing K-NN Manifold Graph...")
+        X = torch.tensor(np.array(features), dtype=torch.float32).to(self.device)
 
-        # Cosine Similarity [cite: 458]
-        norms = torch.norm(features_tensor, p=2, dim=1, keepdim=True)
-        features_norm = features_tensor / (norms + 1e-8)
-        similarity_matrix = torch.mm(features_norm, features_norm.t())
+        norms = torch.norm(X, p=2, dim=1, keepdim=True)
+        sim_matrix = torch.mm(X / (norms + 1e-8), (X / (norms + 1e-8)).t())
+        num_nodes = len(X)
+        actual_k = min(self.k_neighbors + 1, num_nodes)
+        values, indices = torch.topk(sim_matrix, k=actual_k, dim=1)
 
-        # k-NN Graph Construction
-        num_nodes = len(features_tensor)
-        values, indices = torch.topk(similarity_matrix, k=self.k_neighbors_graph_build + 1, dim=1)
-
-        edge_src = []
-        edge_dst = []
-        edge_w = []
-
+        edge_src, edge_dst, edge_w = [], [], []
         for i in range(num_nodes):
             for j_idx, sim_val in zip(indices[i], values[i]):
                 j = j_idx.item()
                 if i != j:
-                    edge_src.append(i)
-                    edge_dst.append(j)
-                    edge_w.append(sim_val.item())
+                    edge_src.append(i), edge_dst.append(j), edge_w.append(sim_val.item())
 
         self.edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long).to(self.device)
         self.edge_weights = torch.tensor(edge_w, dtype=torch.float32).to(self.device)
 
-        # Prepare Dense Adjacency for RWR and Loss calculation
         self.dense_adj = torch.zeros((num_nodes, num_nodes), device=self.device)
         self.dense_adj[self.edge_index[0], self.edge_index[1]] = self.edge_weights
 
-        print(f"Graph constructed: {num_nodes} nodes. Ready for training.")
-
-    def train_gnn_embeddings(self, epochs=200, lr=0.01):
-
-        if self.edge_index is None: raise ValueError("Graph not built.")
-
-        print(f"🏋️ Training GNN for {epochs} epochs to learn manifold structure...")
-        optimizer = optim.Adam(self.gnn.parameters(), lr=lr)
-        self.gnn.train()
-
-        for epoch in range(epochs):
+        print("[GNN] Training Manifold Representation...")
+        optimizer = optim.Adam(self.gnn.parameters(), lr=0.01)
+        for _ in range(epochs):
             optimizer.zero_grad()
-
-            z = self.gnn(self.raw_features, self.edge_index, self.edge_weights)
-
-            # 2. Reconstruct Adjacency (Self-Supervised Loss)
-            # We want dot(z_i, z_j) to approximate the spectral similarity A_ij
+            z = self.gnn(X, self.edge_index, self.edge_weights)
             z_norm = F.normalize(z, p=2, dim=1)
-            adj_pred = torch.matmul(z_norm, z_norm.t())
-
-            loss = F.mse_loss(adj_pred, self.dense_adj)
-
+            loss = F.mse_loss(torch.matmul(z_norm, z_norm.t()), self.dense_adj)
             loss.backward()
             optimizer.step()
-
-            if epoch % 50 == 0:
-                print(f"   Epoch {epoch}/{epochs} | Reconstruction Loss: {loss.item():.6f}")
 
         self.gnn.eval()
         with torch.no_grad():
-            self.task_embeddings = self.gnn(self.raw_features, self.edge_index, self.edge_weights)
-        print("✅ GNN Training Complete. Embeddings updated.")
+            self.task_embeddings = self.gnn(X, self.edge_index, self.edge_weights)
         return self.task_embeddings
 
-    def _compute_rwr_scores(self, start_node_idx, restart_prob=0.15, steps=20):
-
-        num_nodes = self.dense_adj.shape[0]
-
-        row_sums = self.dense_adj.sum(dim=1, keepdim=True) + 1e-8
-        P = self.dense_adj / row_sums
-
-        # Initialize restart vector (target node)
-        r = torch.zeros(num_nodes, device=self.device)
-        r[start_node_idx] = 1.0
-
-        # Restart vector e_i
-        e = r.clone()
-
-        # Iteration
-        for _ in range(steps):
-            # Note: In standard RWR, c is restart prob.
-            # r = (1-c) * P' * r + c * e
-            r = (1 - restart_prob) * torch.matmul(P.t(), r) + restart_prob * e
-
-        return r
-
-    def find_center_task(self):
-        """Unchanged logic, but uses the TRAINED embeddings now."""
-        if self.task_embeddings is None: raise ValueError("Embeddings not computed. Run train_gnn_embeddings first.")
-
-        # Degree Centrality
+    def find_anchor_task(self, alpha=0.65):
+        """Eq. 9: Composite Centrality for Anchor Selection."""
         num_nodes = len(self.task_embeddings)
         degree = torch.zeros(num_nodes, device=self.device)
-        src, _ = self.edge_index
+        src = self.edge_index[0]
         degree.index_add_(0, src, torch.ones_like(src, dtype=torch.float))
         deg_centrality = degree / (degree.max() + 1e-8)
 
-        # Eigenvector Centrality
         eig_centrality = torch.ones(num_nodes, device=self.device)
-        # Use dense adj for stability in power iteration
-        adj = self.dense_adj if self.dense_adj is not None else torch.zeros((num_nodes, num_nodes), device=self.device)
-
         for _ in range(20):
-            eig_centrality = torch.matmul(adj, eig_centrality)
+            eig_centrality = torch.matmul(self.dense_adj, eig_centrality)
             eig_centrality = eig_centrality / (torch.norm(eig_centrality) + 1e-8)
 
-        # Unified Score: alpha * C_eig + (1-alpha) * C_deg [cite: 532]
-        combined_score = 0.6 * eig_centrality + 0.4 * deg_centrality
-        center_idx = torch.argmax(combined_score).item()
-
-        print(f"🎯 Center Task Selected: {center_idx} (Score: {combined_score[center_idx]:.4f})")
-        return center_idx
+        c_center = alpha * eig_centrality + (1 - alpha) * deg_centrality
+        return torch.argmax(c_center).item()
 
     def select_next_task(self, trained_indices, remaining_indices):
-        if not remaining_indices: return None, 0.0
-
-        num_nodes = len(self.task_embeddings)
-        influence = torch.zeros(num_nodes, device=self.device)
+        influence = torch.zeros(len(self.task_embeddings), device=self.device)
         influence[trained_indices] = 1.0
-
-        # Use dense matrix for influence propagation
-        adj = self.dense_adj
-
         for _ in range(3):
-            influence = torch.matmul(adj, influence)
+            influence = torch.matmul(self.dense_adj, influence)
 
-        best_score = -1.0
-        best_idx = None
-        for idx in remaining_indices:
-            score = influence[idx].item()
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        return best_idx, best_score
+        best_idx = max(remaining_indices, key=lambda idx: influence[idx].item())
+        return best_idx, influence[best_idx].item()
 
-    def get_transfer_components(self, target_idx, trained_indices, k=8):
-
-        if len(trained_indices) == 0: return [], []
-
-        # 1. Identify Top-K Candidates from Trained Set based on TRAINED Embedding Similarity
+    def get_transfer_components(self, target_idx, trained_indices, tau=0.1):
+        """Eq. 10: Graph-weighted parameter interpolation."""
         target_emb = self.task_embeddings[target_idx]
         candidates_emb = self.task_embeddings[trained_indices]
-
-        # Cosine similarity in latent space
         sims = F.cosine_similarity(target_emb.unsqueeze(0), candidates_emb)
 
-        # Select Top-K
-        k_actual = min(k, len(trained_indices))
-        top_k_vals, top_k_local_indices = torch.topk(sims, k_actual)
-        neighbor_indices = [trained_indices[i] for i in top_k_local_indices.cpu().numpy()]
+        k_actual = min(self.k_neighbors, len(trained_indices))
+        _, top_k_local = torch.topk(sims, k_actual)
+        neighbor_indices = [trained_indices[i] for i in top_k_local.cpu().numpy()]
 
-        # [FIX 2: Logic Gap] Compute RWR scores specifically for this target node
-        # This gives the true multi-hop probability from target to all other nodes
-        rwr_scores = self._compute_rwr_scores(target_idx)
-
-        # 2. Compute Composite Weights (Eq. 16)
-        weights = []
-        target_neighbors = set(self.edge_index[1][self.edge_index[0] == target_idx].cpu().numpy())
-
-        for i, src_idx in enumerate(neighbor_indices):
-            # Term 1: Direct Similarity (Spectral) - From Embedding Sim
-            w_direct = top_k_vals[i].item()
-
-            # Term 2: Multi-hop (RWR Score)
-            # Fetch the RWR probability of reaching src_idx starting from target_idx
-            w_multihop = rwr_scores[src_idx].item()
-
-            # Term 3: Structural Similarity (Jaccard) [cite: 559]
-            src_neighbors = set(self.edge_index[1][self.edge_index[0] == src_idx].cpu().numpy())
-            intersection = len(target_neighbors & src_neighbors)
-            union = len(target_neighbors | src_neighbors)
-            w_struct = intersection / union if union > 0 else 0.0
-
-            # Composite Weight (Eq. 16 coefficients)
-            # Alpha=0.5, Beta=0.3, Gamma=0.2
-            w_final = 0.5 * w_direct + 0.3 * w_multihop + 0.2 * w_struct
-            weights.append(max(0, w_final))
-
-        # Normalize weights
-        weights = np.array(weights)
-        if weights.sum() > 0:
-            weights = weights / weights.sum()
-        else:
-            weights = np.ones_like(weights) / len(weights)
-
+        neighbor_embs = self.task_embeddings[neighbor_indices]
+        weights = F.softmax(torch.matmul(neighbor_embs, target_emb) / tau, dim=0).cpu().numpy()
         return neighbor_indices, weights
 
-# 5. 参数迁移 (Disk-based Transfer)
-class MemoryEfficientTransfer:
-    """
-    Handles weighted parameter fusion by loading models from disk on-the-fly.
-    Prevents VRAM explosion by never holding all models in memory.
-    Ref: Eq. (15) Convex Combination[cite: 550].
-    """
 
-    def __init__(self, device):
+# =============================================================================
+# 5. Optimization & Transfer Engine
+# Ref: Main Text Section 4.4 & Supplementary Note 2.7
+# =============================================================================
+class TransferTuner:
+    def __init__(self, device, lambda_b=50.0):
         self.device = device
+        self.lambda_b = lambda_b  # Strictly 50.0 for 3D topologies
 
-    def weighted_transfer(self, target_model, neighbor_indices, neighbor_weights, model_dir, task_map):
-        print(f"   ⚖️ Fusing parameters from {len(neighbor_indices)} neighbors (Eq. 15)...")
+    def execute_transfer(self, target_model, neighbor_indices, weights, model_dir, task_map):
         target_state = target_model.state_dict()
+        fused_adapter_state = {k: torch.zeros_like(v).to(self.device) for k, v in target_state.items() if
+                               'adapter' in k}
 
-        # Initialize fused state with zeros
-        fused_state = {k: torch.zeros_like(v).to(self.device) for k, v in target_state.items()}
-        total_valid_weight = 0.0
+        nearest_idx = neighbor_indices[0]  # 1-NN Hard Transfer Base
+        encoder_loaded = False
 
-        # No gradients needed during fusion
-        with torch.no_grad():
-            for idx, real_graph_idx in enumerate(neighbor_indices):
-                weight = neighbor_weights[idx]
-                if weight < 1e-4: continue
+        for idx, graph_idx in enumerate(neighbor_indices):
+            model_path = os.path.join(model_dir, f"task_{task_map[graph_idx]}_migrated.pth")
+            if not os.path.exists(model_path):
+                model_path = os.path.join(model_dir, f"task_{task_map[graph_idx]}_NS.pth")
 
-                real_task_id = task_map[real_graph_idx]
+            if os.path.exists(model_path):
+                src_state = torch.load(model_path, map_location=self.device)
 
-                # Construct possible file paths
-                paths = [
-                    os.path.join(model_dir, f"task_{real_task_id}_NS.pth"),
-                    os.path.join(model_dir, f"task_{real_task_id}_migrated.pth")
-                ]
+                # Invariant Block: 1-NN Inheritance
+                if graph_idx == nearest_idx and not encoder_loaded:
+                    for k in target_state.keys():
+                        if 'encoder' in k: target_state[k].copy_(src_state[k])
+                    encoder_loaded = True
 
-                loaded = False
-                for p in paths:
-                    if os.path.exists(p):
-                        # Load to CPU first to save GPU memory
-                        src_state = torch.load(p, map_location=self.device)
-                        for k in fused_state.keys():
-                            if k in src_state:
-                                fused_state[k] += weight * src_state[k]
-                        total_valid_weight += weight
-                        loaded = True
-                        # Explicitly delete to free memory
-                        del src_state
-                        torch.cuda.empty_cache()
-                        break
+                # Variant Block: Graph-weighted Interpolation
+                for k in fused_adapter_state.keys():
+                    fused_adapter_state[k] += weights[idx] * src_state[k]
 
-                if not loaded:
-                    print(f"   ⚠️ Warning: Neighbor model {real_task_id} not found, skipping.")
-
-        # Re-normalize if some models were missing
-        if total_valid_weight > 0:
-            for k in fused_state.keys():
-                fused_state[k] /= total_valid_weight
-
-        target_model.load_state_dict(fused_state)
+        target_model.load_state_dict(fused_adapter_state, strict=False)
         return target_model
 
-
-# 6. 物理约束精细调整
-class PhysicsTuner:
-    def __init__(self, device):
-        self.device = device
-
-    def train(self, model, data, is_center=False):
-        """
-        Fine-tunes the model using strictly defined data ratios.
-        Center task: 60% data. Transfer task: 20% data[cite: 569, 572].
-        """
-        ratio = 0.6 if is_center else 0.2
-        epochs_adam = 5000 if is_center else 1500
-        epochs_lbfgs = 50000 if is_center else 5000
-
-        # Data Preparation
-        total_len = len(data)
-        if total_len == 0: return model
-
-        n_sample = max(1, int(total_len * ratio))
-        indices = np.random.choice(total_len, n_sample, replace=False)
+    def train_pinn(self, model, data, h_graph, is_anchor=False):
+        """Hybrid Optimization using 30% Coarse-Grid Supervision."""
+        coarse_ratio = 1.0 if is_anchor else 0.3  # 30% for topology-preserving transfer
+        n_sample = max(1, int(len(data) * coarse_ratio))
+        indices = np.random.choice(len(data), n_sample, replace=False)
         sampled_data = data[indices]
 
-        # Split Physics (Collocation) and Boundary points (approx 80/20 split)
-        split = int(n_sample * 0.8)
-        X_phys = torch.tensor(sampled_data[:split, 0:3], dtype=torch.float32, requires_grad=True).to(self.device)
-        X_b = torch.tensor(sampled_data[split:, 0:3], dtype=torch.float32).to(self.device)
-        Y_b = torch.tensor(sampled_data[split:, 3:7], dtype=torch.float32).to(self.device)
+        # Use full available point cloud for physics collocation
+        X_phys = torch.tensor(data[:, 0:3], dtype=torch.float32, requires_grad=True).to(self.device)
+        X_bound = torch.tensor(sampled_data[:, 0:3], dtype=torch.float32).to(self.device)
+        Y_bound = torch.tensor(sampled_data[:, 3:7], dtype=torch.float32).to(self.device)
 
-        # 1. Adam Optimization
+        h_graph_expanded = h_graph.unsqueeze(0).repeat(X_phys.shape[0], 1)
+        h_graph_bound = h_graph.unsqueeze(0).repeat(X_bound.shape[0], 1)
+
         optimizer = optim.Adam(model.parameters(), lr=1e-3)
         model.train()
 
-        def compute_loss():
-            # Boundary Loss
-            pred_b = model.net_NS(X_b)
-            loss_b = torch.mean((pred_b - Y_b) ** 2)
-
-            # Physics Residual Loss (Eq. 19)
-            _, f_u, f_v, f_w, f_e = model.net_f_NS(X_phys)
-            loss_f = torch.mean(f_u ** 2 + f_v ** 2 + f_w ** 2 + f_e ** 2)
-
-            return 100 * loss_b + loss_f
-
-        # print(f"   Starting Adam ({epochs_adam} epochs)...")
-        for _ in range(epochs_adam):
+        epochs_adam = 10000 if is_anchor else 4000
+        for epoch in range(epochs_adam):
             optimizer.zero_grad()
-            loss = compute_loss()
+            pred_b = model(X_bound, h_graph_bound)
+            loss_data = torch.mean((pred_b - Y_bound) ** 2)
+            _, f_u, f_v, f_w, f_e = model.net_f_NS(X_phys, h_graph_expanded)
+            loss_pde = torch.mean(f_u ** 2 + f_v ** 2 + f_w ** 2 + f_e ** 2)
+            loss = self.lambda_b * loss_data + loss_pde
             loss.backward()
             optimizer.step()
 
-        # 2. LBFGS Optimization
-        # print(f"   Starting LBFGS...")
-        lbfgs = LBFGS(model.parameters(), max_iter=epochs_lbfgs, line_search_fn='strong_wolfe')
+        print("[Tuner] Entering L-BFGS-B Refinement phase...")
+        lbfgs = LBFGS(model.parameters(), max_iter=2000, tolerance_grad=1e-5, line_search_fn='strong_wolfe')
 
         def closure():
             lbfgs.zero_grad()
-            loss = compute_loss()
+            loss_data = torch.mean((model(X_bound, h_graph_bound) - Y_bound) ** 2)
+            _, f_u, f_v, f_w, f_e = model.net_f_NS(X_phys, h_graph_expanded)
+            loss_pde = torch.mean(f_u ** 2 + f_v ** 2 + f_w ** 2 + f_e ** 2)
+            loss = self.lambda_b * loss_data + loss_pde
             loss.backward()
             return loss
 
@@ -528,139 +351,478 @@ class PhysicsTuner:
         return model
 
 
-# 7. 主程序 (Main Execution)
+# =============================================================================
+# 6. Main Execution Pipeline
+# =============================================================================
 if __name__ == "__main__":
-    # Configuration
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default="./data")
+    parser.add_argument("--output_dir", type=str, default="./output_models")
+    parser.add_argument("--alpha", type=float, default=0.65, help="Centrality weight (0.65 SWRO, 0.50 Benchmarks)")
+    args = parser.parse_args()
+
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 请根据实际情况修改以下路径
-    DATA_ROOT = r"D:\task2\csv_cases"
-    OUTPUT_DIR = r"D:\task2\output_models_optimized"
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # Initialize Components
-    extractor = SpectralFeatureExtractor()
-    # 150 dim = 60 (PSD) + 80 (FFT) + 10 (POD)
-    knowledge_net = AdvancedKnowledgeNetwork(input_dim=150, device=DEVICE, k_neighbors=30)
-    transfer_engine = MemoryEfficientTransfer(DEVICE)
-    tuner = PhysicsTuner(DEVICE)
+    extractor = SpectralPhysicalExtractor()
+    knowledge_net = AdvancedKnowledgeNetwork(DEVICE, k_neighbors=5)
+    tuner = TransferTuner(DEVICE, lambda_b=50.0)
 
-    # ---------------------------------------------------------
-    # Step 1: Data Loading & Feature Extraction
-    # ---------------------------------------------------------
-    print(" Step 1: Extracting Features & Loading Data...")
-    task_features = []
-    task_data_map = {}  # Map internal graph index -> raw data
-    task_id_map = {}  # Map internal graph index -> real task ID (from filename)
+    # Step 1: Preprocessing & Feature Extraction
+    task_features, task_data_map, task_id_map = [], {}, {}
+    csv_files = sorted(glob.glob(os.path.join(args.data_dir, "case_*.csv")))
 
-    # Scan directories
-    case_dirs = sorted(glob.glob(os.path.join(DATA_ROOT, "case_*")))
-    internal_idx = 0
+    for idx, csv_path in enumerate(csv_files):
+        print(f"[Process] Loading and mapping {csv_path}...")
+        case_id = int(os.path.basename(csv_path).replace("case_", "").replace(".csv", ""))
+        df = pd.read_csv(csv_path)
 
-    for case_dir in case_dirs:
-        try:
-            case_name = os.path.basename(case_dir)
-            case_id = int(case_name.split('_')[1])
-            csv_path = os.path.join(case_dir, f"{case_name}.csv")
+        coords = df[['x', 'y', 'z']].values
+        phys_fields = df[['u', 'v', 'w', 'p']].values
 
-            if not os.path.exists(csv_path): continue
+        # Norm & Cartesian Resampling -> 3D Tensor -> Spectral Features
+        coords_norm = nondimensionalize_coordinates(coords)
+        tensor_3d = cartesian_resampling(coords_norm, phys_fields, resolution=32)
+        feats = extractor.compute_features(tensor_3d)
 
-            # Load Data
-            data = np.loadtxt(csv_path, delimiter=',')
-            if data.shape[0] < 50: continue  # Skip empty/small files
+        # Combine norm coords and fields for PINN training
+        norm_data = np.hstack([coords_norm, phys_fields])
 
-            # Extract Spectral Features
-            feats = extractor.compute_spectral_features(data)
+        task_features.append(feats)
+        task_data_map[idx] = norm_data
+        task_id_map[idx] = case_id
 
-            task_features.append(feats)
-            task_data_map[internal_idx] = data
-            task_id_map[internal_idx] = case_id
-            internal_idx += 1
+    # Step 2: Build Manifold Graph
+    embeddings = knowledge_net.build_and_train_graph(task_features)
+    anchor_idx = knowledge_net.find_anchor_task(alpha=args.alpha)
+    print(f"\n[System] Identified Anchor Task ID: {task_id_map[anchor_idx]}")
 
-            if internal_idx % 50 == 0: print(f"   Processed {internal_idx} tasks...")
-        except Exception as e:
-            print(f"   Error processing {case_dir}: {e}")
+    # Step 3: Train Anchor Task
+    anchor_model = GD_PINNs_Net().to(DEVICE)
+    h_anchor = embeddings[anchor_idx].detach()
+    anchor_model = tuner.train_pinn(anchor_model, task_data_map[anchor_idx], h_anchor, is_anchor=True)
+    torch.save(anchor_model.state_dict(), os.path.join(args.output_dir, f"task_{task_id_map[anchor_idx]}_NS.pth"))
 
-    num_tasks = len(task_features)
-    print(f"✅ Total valid tasks: {num_tasks}")
+    # Step 4: Progressive Transfer Execution
+    trained_indices = [anchor_idx]
+    remaining_indices = [i for i in range(len(task_features)) if i != anchor_idx]
 
-    if num_tasks == 0:
-        print(" No valid tasks found. Exiting.")
-        exit()
-
-    # ---------------------------------------------------------
-    # Step 2: Build Graph & Select Center Task
-    # ---------------------------------------------------------
-    print("\n Step 2: Building Knowledge Graph...")
-    knowledge_net.build_sparse_knowledge_graph(task_features)
-
-    # [新增步骤] 训练 GNN 以学习流形结构
-    # 这会更新 knowledge_net.task_embeddings
-    knowledge_net.train_gnn_embeddings(epochs=200, lr=0.01)
-
-    center_idx = knowledge_net.find_center_task()
-    real_center_id = task_id_map[center_idx]
-    print(f"   Center Task Real ID: {real_center_id}")
-
-    # ---------------------------------------------------------
-    # Step 3: Train Center Task
-    # ---------------------------------------------------------
-    print(f"\n Step 3: Training Center Task {real_center_id}...")
-    center_model = VPNSFnet().to(DEVICE)
-
-    # Check if pretrained exists
-    pretrained_path = os.path.join(r"D:\task2\trained_models", f"task_{real_center_id}_NS.pth")
-    if os.path.exists(pretrained_path):
-        center_model.load_state_dict(torch.load(pretrained_path, map_location=DEVICE))
-        print("   Loaded pretrained weights.")
-
-    center_model = tuner.train(center_model, task_data_map[center_idx], is_center=True)
-
-    # SAVE to disk and DELETE from memory (Fixing VRAM issue)
-    save_path = os.path.join(OUTPUT_DIR, f"task_{real_center_id}_NS.pth")
-    torch.save(center_model.state_dict(), save_path)
-    print(f"    Saved center model to {save_path}")
-
-    del center_model
-    torch.cuda.empty_cache()
-
-    # Step 4: Progressive Transfer Loop
-
-    print("\n Step 4: Starting Progressive Transfer...")
-
-    trained_indices = [center_idx]
-    remaining_indices = [i for i in range(num_tasks) if i != center_idx]
-
-    loop_count = 0
     while remaining_indices:
-        loop_count += 1
-        print(f"\n--- Transfer Iteration {loop_count} ---")
+        target_idx, _ = knowledge_net.select_next_task(trained_indices, remaining_indices)
+        real_id = task_id_map[target_idx]
+        h_target = embeddings[target_idx].detach()
 
-        next_idx, score = knowledge_net.select_next_task(trained_indices, remaining_indices)
-        if next_idx is None: break
+        neighbor_indices, weights = knowledge_net.get_transfer_components(target_idx, trained_indices)
+        print(f"\n[Transfer] Target ID {real_id} | Neighbors: {[task_id_map[i] for i in neighbor_indices]}")
 
-        real_id = task_id_map[next_idx]
-        print(f" Selected Task {real_id} (Influence Score: {score:.4f})")
+        target_model = GD_PINNs_Net().to(DEVICE)
+        target_model = tuner.execute_transfer(target_model, neighbor_indices, weights, args.output_dir, task_id_map)
+        target_model = tuner.train_pinn(target_model, task_data_map[target_idx], h_target, is_anchor=False)
+        """
+        GD-PINNs: Graph-Diffusion Physics-Informed Neural Networks
+        End-to-end pipeline with rigorous topological preservation and natural-neighbor surrogates.
+        """
 
-        neighbor_indices, weights = knowledge_net.get_transfer_components(next_idx, trained_indices, k=8)
-        print(f"   Neighbors (Graph IDs): {neighbor_indices}")
-        print(f"   Weights: {np.round(weights, 3)}")
+        import argparse
+        import os
+        import glob
+        import numpy as np
+        import pandas as pd
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        import torch.autograd as autograd
+        import torch.optim as optim
+        from torch.optim import LBFGS
+        from scipy.spatial import cKDTree
+        from scipy.fft import fftn, fftshift
+        from torch_geometric.nn import GATConv
 
-        new_model = VPNSFnet().to(DEVICE)
-        new_model = transfer_engine.weighted_transfer(
-            new_model, neighbor_indices, weights, OUTPUT_DIR, task_id_map
-        )
 
-        new_model = tuner.train(new_model, task_data_map[next_idx], is_center=False)
+        # =============================================================================
+        # 1. Rigorous Data Preprocessing & Topological Subsampling
+        # =============================================================================
+        def nondimensionalize_coordinates(coords):
+            """Affine mapping to [-1, 1]^3 for optimal tanh active region gradients."""
+            coords_min = np.min(coords, axis=0)
+            l_ref = np.max(np.max(coords, axis=0) - coords_min)
+            coords_norm = 2.0 * (coords - coords_min) / l_ref - 1.0
+            return np.clip(coords_norm, -1.0, 1.0)
 
-        save_path = os.path.join(OUTPUT_DIR, f"task_{real_id}_migrated.pth")
-        torch.save(new_model.state_dict(), save_path)
 
-        del new_model
-        torch.cuda.empty_cache()
+        def natural_neighbor_surrogate_resampling(coords_norm, solution_fields, resolution=64, k_neighbors=8):
+            """
+            Reconstructs continuous manifolds using KD-Tree IDW with adaptive Gaussian kernel.
+            Replaces griddata(linear) to eliminate C1 discontinuities.
+            """
+            reference_axis = np.linspace(-1.0, 1.0, resolution)
+            grid_x, grid_y, grid_z = np.meshgrid(reference_axis, reference_axis, reference_axis, indexing="ij")
+            target_points = np.column_stack([grid_x.ravel(), grid_y.ravel(), grid_z.ravel()])
 
-        trained_indices.append(next_idx)
-        remaining_indices.remove(next_idx)
+            tree = cKDTree(coords_norm)
+            distances, indices = tree.query(target_points, k=k_neighbors)
 
-        print(f"✅ Task {real_id} completed. Progress: {len(trained_indices)}/{num_tasks}")
+            # Adaptive bandwidth based on Cartesian grid voxel size
+            sigma = 2.0 / resolution
+            weights = np.exp(-(distances ** 2) / (sigma ** 2)) + 1e-8
+            weights /= np.sum(weights, axis=1, keepdims=True)
 
-    print("\n All tasks completed successfully.")
+            num_channels = solution_fields.shape[1]
+            structured_fields = np.zeros((target_points.shape[0], num_channels), dtype=np.float64)
+
+            for c in range(num_channels):
+                structured_fields[:, c] = np.sum(weights * solution_fields[indices, c], axis=1)
+
+            return structured_fields.reshape(resolution, resolution, resolution, num_channels)
+
+
+        def topology_preserving_subsampling(coords, solution_fields, retain_ratio=0.3):
+            """
+            Voxel Grid Filter for uniform spatial downsampling.
+            Strictly preserves the spatial lattice structure required for topological anchoring.
+            """
+            num_points = len(coords)
+            target_points = int(num_points * retain_ratio)
+            if target_points <= 0 or target_points >= num_points:
+                return coords, solution_fields
+
+            domain_extent = np.max(coords, axis=0) - np.min(coords, axis=0)
+            domain_volume = np.prod(np.where(domain_extent > 0, domain_extent, 1e-8))
+            voxel_size = (domain_volume / target_points) ** (1 / 3)
+
+            voxel_indices = np.floor((coords - np.min(coords, axis=0)) / voxel_size).astype(int)
+            hashes = voxel_indices[:, 0] + voxel_indices[:, 1] * 1000 + voxel_indices[:, 2] * 1000000
+            df = pd.DataFrame({'hash': hashes, 'index': np.arange(num_points)})
+
+            sampled_indices = df.groupby('hash').first()['index'].values
+
+            if len(sampled_indices) < target_points:
+                remaining_needed = target_points - len(sampled_indices)
+                available_indices = np.setdiff1d(np.arange(num_points), sampled_indices)
+                top_up = np.random.choice(available_indices, remaining_needed, replace=False)
+                sampled_indices = np.concatenate([sampled_indices, top_up])
+
+            return coords[sampled_indices], solution_fields[sampled_indices]
+
+
+        # =============================================================================
+        # 2. 3D Spectral-Physical Feature Extraction
+        # =============================================================================
+        class SpectralPhysicalExtractor:
+            def __init__(self, d_pod=10, d_psd=60, d_fft=80):
+                self.d_pod = d_pod
+                self.d_psd = d_psd
+                self.d_fft = d_fft
+
+            def compute_features(self, tensor_3d):
+                fft_features = []
+                center = np.array(tensor_3d.shape[:3]) // 2
+
+                # Spherical Low-Pass Mask (R=3) to isolate pure low wavenumbers
+                R = 3.0
+                z_grid, y_grid, x_grid = np.ogrid[:tensor_3d.shape[0], :tensor_3d.shape[1], :tensor_3d.shape[2]]
+                spherical_mask = (x_grid - center[0]) ** 2 + (y_grid - center[1]) ** 2 + (
+                            z_grid - center[2]) ** 2 <= R ** 2
+
+                for c in range(4):
+                    fft_3d = np.abs(fftn(tensor_3d[..., c]))
+                    fft_3d = fftshift(fft_3d)
+                    low_freq_modes = fft_3d[spherical_mask]
+                    top_modes = np.sort(low_freq_modes)[::-1][:20]
+                    top_modes = np.pad(top_modes, (0, max(0, 20 - len(top_modes))))
+                    fft_features.extend(top_modes / (np.sum(top_modes) + 1e-8))
+
+                psd_features = []
+                for axis in range(3):
+                    axis_energy = np.sum(tensor_3d[..., 0] ** 2 + tensor_3d[..., 1] ** 2 + tensor_3d[..., 2] ** 2,
+                                         axis=tuple([i for i in range(3) if i != axis]))
+                    psd_1d = np.abs(np.fft.fft(axis_energy))[:20]
+                    psd_1d = np.pad(psd_1d, (0, max(0, 20 - len(psd_1d))))[:20]
+                    psd_features.extend(psd_1d / (np.sum(psd_1d) + 1e-8))
+
+                # Adaptive POD Truncation (>95% Energy)
+                snapshot_matrix = tensor_3d.reshape(-1, 4)
+                try:
+                    _, S, _ = np.linalg.svd(snapshot_matrix, full_matrices=False)
+                    energy = S ** 2
+                    total_energy = np.sum(energy)
+                    cumulative_energy = np.cumsum(energy) / total_energy
+                    k_95 = np.argmax(cumulative_energy >= 0.95) + 1
+                    k_optimal = min(k_95, self.d_pod)
+                    pod_features = (energy[:k_optimal] / total_energy)
+                except np.linalg.LinAlgError:
+                    pod_features = np.ones(self.d_pod) / self.d_pod
+
+                pod_features = np.pad(pod_features, (0, max(0, self.d_pod - len(pod_features))))
+
+                return np.concatenate([fft_features, psd_features, pod_features])
+
+
+        # =============================================================================
+        # 3. Manifold-Conditioned Operator-Geometry Architecture (Width: 100)
+        # =============================================================================
+        class GD_PINNs_Net(nn.Module):
+            def __init__(self, Re=229.1451, graph_emb_dim=64):
+                super().__init__()
+                self.Re = Re
+                self.encoder = nn.Sequential(
+                    nn.Linear(3, 100), nn.Tanh(), nn.Linear(100, 100), nn.Tanh(),
+                    nn.Linear(100, 100), nn.Tanh(), nn.Linear(100, 100), nn.Tanh()
+                )
+                self.film_mlp = nn.Sequential(nn.Linear(graph_emb_dim, 100), nn.ReLU(), nn.Linear(100, 200))
+                self.adapter = nn.Sequential(
+                    nn.Linear(100, 100), nn.Tanh(), nn.Linear(100, 100), nn.Tanh(), nn.Linear(100, 4)
+                )
+
+            def forward(self, x, h_graph):
+                latent = self.encoder(x)
+                film_params = self.film_mlp(h_graph)
+                return self.adapter(film_params[:, :100] * latent + film_params[:, 100:])
+
+            def net_f_NS(self, x, h_graph):
+                x = x.clone().detach().requires_grad_(True)
+                uvwp = self.forward(x, h_graph)
+                u, v, w, p = uvwp[:, 0:1], uvwp[:, 1:2], uvwp[:, 2:3], uvwp[:, 3:4]
+
+                def grads(y): return autograd.grad(y, x, torch.ones_like(y), create_graph=True)[0]
+
+                u_grads, v_grads, w_grads, p_grads = grads(u), grads(v), grads(w), grads(p)
+                u_x, u_y, u_z = u_grads[:, 0:1], u_grads[:, 1:2], u_grads[:, 2:3]
+                v_x, v_y, v_z = v_grads[:, 0:1], v_grads[:, 1:2], v_grads[:, 2:3]
+                w_x, w_y, w_z = w_grads[:, 0:1], w_grads[:, 1:2], w_grads[:, 2:3]
+                p_x, p_y, p_z = p_grads[:, 0:1], p_grads[:, 1:2], p_grads[:, 2:3]
+
+                u_xx, u_yy, u_zz = grads(u_x)[:, 0:1], grads(u_y)[:, 1:2], grads(u_z)[:, 2:3]
+                v_xx, v_yy, v_zz = grads(v_x)[:, 0:1], grads(v_y)[:, 1:2], grads(v_z)[:, 2:3]
+                w_xx, w_yy, w_zz = grads(w_x)[:, 0:1], grads(w_y)[:, 1:2], grads(w_z)[:, 2:3]
+
+                inv_Re = 1.0 / self.Re
+                f_e = u_x + v_y + w_z
+                f_u = u * u_x + v * u_y + w * u_z + p_x - inv_Re * (u_xx + u_yy + u_zz)
+                f_v = u * v_x + v * v_y + w * v_z + p_y - inv_Re * (v_xx + v_yy + v_zz)
+                f_w = u * w_x + v * w_y + w * w_z + p_z - inv_Re * (w_xx + w_yy + w_zz)
+
+                return uvwp, f_u, f_v, f_w, f_e
+
+
+        # =============================================================================
+        # 4. Graph Architecture & Knowledge Network
+        # =============================================================================
+        class ManifoldGNN(nn.Module):
+            def __init__(self, input_dim=150, hidden_dim=128, output_dim=64, heads=4):
+                super().__init__()
+                self.gat1 = GATConv(input_dim, hidden_dim, heads=heads, concat=True)
+                self.gat2 = GATConv(hidden_dim * heads, output_dim, heads=1, concat=False)
+
+            def forward(self, x, edge_index, edge_weight=None):
+                x = F.leaky_relu(self.gat1(x, edge_index, edge_weight), negative_slope=0.2)
+                return F.leaky_relu(self.gat2(x, edge_index, edge_weight), negative_slope=0.2)
+
+
+        class AdvancedKnowledgeNetwork:
+            def __init__(self, device, k_neighbors=5, output_dim=64):
+                self.device = device
+                self.k_neighbors = k_neighbors
+                self.gnn = ManifoldGNN(output_dim=output_dim).to(device)
+                self.task_embeddings = None
+
+            def build_and_train_graph(self, features, epochs=200):
+                X = torch.tensor(np.array(features), dtype=torch.float32).to(self.device)
+                norms = torch.norm(X, p=2, dim=1, keepdim=True)
+                sim_matrix = torch.mm(X / (norms + 1e-8), (X / (norms + 1e-8)).t())
+
+                actual_k = min(self.k_neighbors + 1, len(X))
+                values, indices = torch.topk(sim_matrix, k=actual_k, dim=1)
+
+                edge_src, edge_dst, edge_w = [], [], []
+                for i in range(len(X)):
+                    for j_idx, sim_val in zip(indices[i], values[i]):
+                        j = j_idx.item()
+                        if i != j:
+                            edge_src.append(i), edge_dst.append(j), edge_w.append(sim_val.item())
+
+                self.edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long).to(self.device)
+                self.edge_weights = torch.tensor(edge_w, dtype=torch.float32).to(self.device)
+                self.dense_adj = torch.zeros((len(X), len(X)), device=self.device)
+                self.dense_adj[self.edge_index[0], self.edge_index[1]] = self.edge_weights
+
+                optimizer = optim.Adam(self.gnn.parameters(), lr=0.01)
+                for _ in range(epochs):
+                    optimizer.zero_grad()
+                    z = self.gnn(X, self.edge_index, self.edge_weights)
+                    z_norm = F.normalize(z, p=2, dim=1)
+                    loss = F.mse_loss(torch.matmul(z_norm, z_norm.t()), self.dense_adj)
+                    loss.backward()
+                    optimizer.step()
+
+                self.gnn.eval()
+                with torch.no_grad():
+                    self.task_embeddings = self.gnn(X, self.edge_index, self.edge_weights)
+                return self.task_embeddings
+
+            def find_anchor_task(self, alpha=0.65):
+                degree = torch.zeros(len(self.task_embeddings), device=self.device)
+                degree.index_add_(0, self.edge_index[0], torch.ones_like(self.edge_index[0], dtype=torch.float))
+                deg_cen = degree / (degree.max() + 1e-8)
+
+                eig_cen = torch.ones(len(self.task_embeddings), device=self.device)
+                for _ in range(20):
+                    eig_cen = torch.matmul(self.dense_adj, eig_cen)
+                    eig_cen = eig_cen / (torch.norm(eig_cen) + 1e-8)
+
+                return torch.argmax(alpha * eig_cen + (1 - alpha) * deg_cen).item()
+
+            def select_next_task(self, trained_indices, remaining_indices):
+                influence = torch.zeros(len(self.task_embeddings), device=self.device)
+                influence[trained_indices] = 1.0
+                for _ in range(3): influence = torch.matmul(self.dense_adj, influence)
+                best_idx = max(remaining_indices, key=lambda idx: influence[idx].item())
+                return best_idx, influence[best_idx].item()
+
+            def get_transfer_components(self, target_idx, trained_indices, tau=0.1):
+                sims = F.cosine_similarity(self.task_embeddings[target_idx].unsqueeze(0),
+                                           self.task_embeddings[trained_indices])
+                _, top_k = torch.topk(sims, min(self.k_neighbors, len(trained_indices)))
+                neighbors = [trained_indices[i] for i in top_k.cpu().numpy()]
+                weights = F.softmax(
+                    torch.matmul(self.task_embeddings[neighbors], self.task_embeddings[target_idx]) / tau, dim=0)
+                return neighbors, weights.cpu().numpy()
+
+
+        # =============================================================================
+        # 5. Optimization & Transfer Engine
+        # =============================================================================
+        class TransferTuner:
+            def __init__(self, device, lambda_b=50.0):
+                self.device = device
+                self.lambda_b = lambda_b
+
+            def execute_transfer(self, target_model, neighbor_indices, weights, model_dir, task_map):
+                target_state = target_model.state_dict()
+                fused_adapter = {k: torch.zeros_like(v).to(self.device) for k, v in target_state.items() if
+                                 'adapter' in k}
+
+                nearest_idx, encoder_loaded = neighbor_indices[0], False
+
+                for idx, graph_idx in enumerate(neighbor_indices):
+                    path = os.path.join(model_dir, f"task_{task_map[graph_idx]}_migrated.pth")
+                    if not os.path.exists(path): path = os.path.join(model_dir, f"task_{task_map[graph_idx]}_NS.pth")
+
+                    if os.path.exists(path):
+                        src_state = torch.load(path, map_location=self.device)
+                        if graph_idx == nearest_idx and not encoder_loaded:
+                            for k in target_state.keys():
+                                if 'encoder' in k: target_state[k].copy_(src_state[k])
+                            encoder_loaded = True
+
+                        for k in fused_adapter.keys(): fused_adapter[k] += weights[idx] * src_state[k]
+
+                target_model.load_state_dict(fused_adapter, strict=False)
+                return target_model
+
+            def train_pinn(self, model, data, h_graph, is_anchor=False):
+                coarse_ratio = 1.0 if is_anchor else 0.3
+
+                # Rigorous Topology-Preserving Subsampling replaces random choice
+                coords = data[:, 0:3]
+                fields = data[:, 3:7]
+                sampled_coords, sampled_fields = topology_preserving_subsampling(coords, fields,
+                                                                                 retain_ratio=coarse_ratio)
+
+                X_phys = torch.tensor(coords, dtype=torch.float32, requires_grad=True).to(self.device)
+                X_bound = torch.tensor(sampled_coords, dtype=torch.float32).to(self.device)
+                Y_bound = torch.tensor(sampled_fields, dtype=torch.float32).to(self.device)
+
+                h_graph_exp = h_graph.unsqueeze(0).repeat(X_phys.shape[0], 1)
+                h_graph_bnd = h_graph.unsqueeze(0).repeat(X_bound.shape[0], 1)
+
+                optimizer = optim.Adam(model.parameters(), lr=1e-3)
+                model.train()
+
+                for _ in range(10000 if is_anchor else 4000):
+                    optimizer.zero_grad()
+                    loss_data = torch.mean((model(X_bound, h_graph_bnd) - Y_bound) ** 2)
+                    _, f_u, f_v, f_w, f_e = model.net_f_NS(X_phys, h_graph_exp)
+                    loss_pde = torch.mean(f_u ** 2 + f_v ** 2 + f_w ** 2 + f_e ** 2)
+                    loss = self.lambda_b * loss_data + loss_pde
+                    loss.backward()
+                    optimizer.step()
+
+                lbfgs = LBFGS(model.parameters(), max_iter=2000, tolerance_grad=1e-5, line_search_fn='strong_wolfe')
+
+                def closure():
+                    lbfgs.zero_grad()
+                    loss_data = torch.mean((model(X_bound, h_graph_bnd) - Y_bound) ** 2)
+                    _, f_u, f_v, f_w, f_e = model.net_f_NS(X_phys, h_graph_exp)
+                    loss_pde = torch.mean(f_u ** 2 + f_v ** 2 + f_w ** 2 + f_e ** 2)
+                    loss = self.lambda_b * loss_data + loss_pde
+                    loss.backward()
+                    return loss
+
+                lbfgs.step(closure)
+                return model
+
+
+        # =============================================================================
+        # 6. Main Execution Pipeline
+        # =============================================================================
+        if __name__ == "__main__":
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--data_dir", type=str, default="./data")
+            parser.add_argument("--output_dir", type=str, default="./output_models")
+            parser.add_argument("--alpha", type=float, default=0.65)
+            args = parser.parse_args()
+
+            DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            os.makedirs(args.output_dir, exist_ok=True)
+
+            extractor = SpectralPhysicalExtractor()
+            knowledge_net = AdvancedKnowledgeNetwork(DEVICE, k_neighbors=5)
+            tuner = TransferTuner(DEVICE, lambda_b=50.0)
+
+            task_features, task_data_map, task_id_map = [], {}, {}
+            for idx, csv_path in enumerate(sorted(glob.glob(os.path.join(args.data_dir, "case_*.csv")))):
+                case_id = int(os.path.basename(csv_path).replace("case_", "").replace(".csv", ""))
+                df = pd.read_csv(csv_path)
+
+                coords, phys_fields = df[['x', 'y', 'z']].values, df[['u', 'v', 'w', 'p']].values
+                coords_norm = nondimensionalize_coordinates(coords)
+
+                tensor_3d = natural_neighbor_surrogate_resampling(coords_norm, phys_fields, resolution=64)
+                task_features.append(extractor.compute_features(tensor_3d))
+
+                task_data_map[idx] = np.hstack([coords_norm, phys_fields])
+                task_id_map[idx] = case_id
+
+            embeddings = knowledge_net.build_and_train_graph(task_features)
+            anchor_idx = knowledge_net.find_anchor_task(alpha=args.alpha)
+
+            anchor_model = GD_PINNs_Net().to(DEVICE)
+            anchor_model = tuner.train_pinn(anchor_model, task_data_map[anchor_idx], embeddings[anchor_idx].detach(),
+                                            is_anchor=True)
+            torch.save(anchor_model.state_dict(),
+                       os.path.join(args.output_dir, f"task_{task_id_map[anchor_idx]}_NS.pth"))
+
+            trained_indices = [anchor_idx]
+            remaining_indices = [i for i in range(len(task_features)) if i != anchor_idx]
+
+            while remaining_indices:
+                target_idx, _ = knowledge_net.select_next_task(trained_indices, remaining_indices)
+                real_id = task_id_map[target_idx]
+
+                neighbor_indices, weights = knowledge_net.get_transfer_components(target_idx, trained_indices)
+
+                target_model = GD_PINNs_Net().to(DEVICE)
+                target_model = tuner.execute_transfer(target_model, neighbor_indices, weights, args.output_dir,
+                                                      task_id_map)
+                target_model = tuner.train_pinn(target_model, task_data_map[target_idx],
+                                                embeddings[target_idx].detach(), is_anchor=False)
+
+                torch.save(target_model.state_dict(), os.path.join(args.output_dir, f"task_{real_id}_migrated.pth"))
+                trained_indices.append(target_idx)
+                remaining_indices.remove(target_idx)
+        torch.save(target_model.state_dict(), os.path.join(args.output_dir, f"task_{real_id}_migrated.pth"))
+        trained_indices.append(target_idx)
+        remaining_indices.remove(target_idx)
+
+    print("GD-PINNs Manifold Transfer Pipeline Completed Successfully.")
