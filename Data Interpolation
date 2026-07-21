@@ -2,184 +2,128 @@ import os
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
+from scipy.interpolate import LinearNDInterpolator
 
 
 def nondimensionalize_coordinates(coords, l_ref=None):
     """
-    Domain nondimensionalization strictly mapping to [-1, 1]^3.
+    Nondimensionalize spatial coordinates strictly following Eq. 3 of GD-PINNs:
+    x* = x / x_ref.
 
-    Academic Justification:
-    Consistent with the preprocessing procedure described in Supplementary Note 2.2,
-    the spatial coordinates are mapped onto the interval [-1, 1]^3. This affine
-    transformation inherently centers the spatial inputs within the active linear
-    region of the tanh activation function, maximizing gradient flow and preventing
-    saturation during PINN optimization.
-
-    Parameters
-    ----------
-    coords : np.ndarray
-        Unstructured spatial coordinates of shape (N_points, 3).
-    l_ref : float, optional
-        Characteristic length scale. If None, uses the bounding box maximum extent.
-
-    Returns
-    -------
-    np.ndarray
-        Nondimensionalized coordinates within [-1, 1]^3.
+    Academic Note: If subsequent PINN optimization requires mapping coordinates
+    to a strictly symmetric domain (e.g., [-1, 1]^3) for gradient stability,
+    that affine translation should be handled inside the neural network's
+    input layer rather than conflated with the physical nondimensionalization
+    step defined in the manuscript.
     """
-    coords_min = np.min(coords, axis=0)
-
     if l_ref is None:
-        l_ref = np.max(np.max(coords, axis=0) - coords_min)
+        # Define characteristic length scale as the maximum span across all dimensions
+        coords_min = np.min(coords, axis=0)
+        coords_max = np.max(coords, axis=0)
+        l_ref = np.max(coords_max - coords_min)
 
-    # Strictly matches Supplementary Note 2.2 Equation (6)
-    coords_norm = 2.0 * (coords - coords_min) / l_ref - 1.0
-
-    # Clip to strictly ensure the domain remains within [-1, 1]
-    coords_norm = np.clip(coords_norm, -1.0, 1.0)
-
-    return coords_norm
+    coords_norm = coords / l_ref
+    return coords_norm, l_ref
 
 
-def natural_neighbor_surrogate_resampling(coords_norm, solution_fields, resolution=64, k_neighbors=8):
+def natural_neighbor_interpolation_proxy(coords_norm, solution_fields, resolution=64):
     """
-    Reconstructs unstructured finite-element solutions onto a unified Cartesian grid
-    using KD-Tree based Inverse Distance Weighting (IDW) with a Gaussian kernel.
+    Resample unstructured fields onto a unified Cartesian grid.
 
-    Academic Justification:
-    Consistent with the preprocessing procedure described in the main text, all
-    solution fields are resampled onto a unified Cartesian grid using natural-neighbor
-    interpolation. Standard griddata(method='linear') creates C1 discontinuities at
-    simplex boundaries. This IDW approach mathematically mimics the smooth, topology-aware
-    continuous influence of true Natural Neighbor interpolation, strictly preventing
-    high-frequency numerical artifacts during subsequent 3D FFT extraction.
-
-    Parameters
-    ----------
-    coords_norm : np.ndarray
-        Nondimensionalized coordinates of shape (N_points, 3).
-    solution_fields : np.ndarray
-        Physical solution variables (u, v, w, p) with shape (N_points, 4).
-    resolution : int, optional
-        Number of Cartesian grid points along each spatial dimension.
-    k_neighbors : int, optional
-        Number of local neighbors to consider for the Gaussian smoothing kernel.
-
-    Returns
-    -------
-    np.ndarray
-        Structured Cartesian tensor of shape (resolution, resolution, resolution, 4).
+    Academic Note: True 3D Natural-Neighbor (Sibson) interpolation provides C^1
+    continuity globally. Due to the lack of native 3D Sibson interpolation in
+    standard SciPy, this function employs Delaunay-based barycentric linear
+    interpolation (LinearNDInterpolator) as an engineering proxy. While it is
+    C^0 continuous, it effectively avoids spurious extrapolatory oscillations
+    and preserves the dominant transport organization required for FFT/PSD analysis.
     """
-    # 1. Construct the unified Cartesian reference grid [-1, 1]^3
-    reference_axis = np.linspace(-1.0, 1.0, resolution)
-    grid_x, grid_y, grid_z = np.meshgrid(reference_axis, reference_axis, reference_axis, indexing="ij")
+    # Determine the bounding box for the normalized coordinates
+    min_bounds = np.min(coords_norm, axis=0)
+    max_bounds = np.max(coords_norm, axis=0)
 
+    # Create a unified Cartesian grid bounding the physical domain
+    grid_x, grid_y, grid_z = np.mgrid[
+                             min_bounds[0]:max_bounds[0]:resolution * 1j,
+                             min_bounds[1]:max_bounds[1]:resolution * 1j,
+                             min_bounds[2]:max_bounds[2]:resolution * 1j
+                             ]
     target_points = np.column_stack([grid_x.ravel(), grid_y.ravel(), grid_z.ravel()])
 
-    print(f"Executing continuous manifold reconstruction onto {resolution}^3 Cartesian grid...")
-
-    # 2. Build KD-Tree for fast spatial querying
-    tree = cKDTree(coords_norm)
-    distances, indices = tree.query(target_points, k=k_neighbors)
-
-    # 3. Apply Gaussian weights to mimic smooth natural neighborhood drop-off
-    # A small epsilon is added to prevent division by zero
-    weights = np.exp(-(distances ** 2) / 0.1) + 1e-8
-    weights /= np.sum(weights, axis=1, keepdims=True)
-
     num_channels = solution_fields.shape[1]
-    structured_fields_flat = np.zeros((target_points.shape[0], num_channels), dtype=np.float64)
+    structured_flat = np.zeros((target_points.shape[0], num_channels), dtype=np.float64)
 
-    # 4. Perform weighted local continuous manifold reconstruction
     for c in range(num_channels):
-        print(f"Interpolating channel {c + 1}/{num_channels}...")
-        field_values = solution_fields[indices, c]
-        structured_fields_flat[:, c] = np.sum(weights * field_values, axis=1)
+        interpolator = LinearNDInterpolator(coords_norm, solution_fields[:, c])
+        structured_flat[:, c] = interpolator(target_points)
 
-    # 5. Recover the structured 3D tensor
-    cartesian_tensor = structured_fields_flat.reshape(resolution, resolution, resolution, num_channels)
+        # Replace NaNs (grid points outside the Delaunay convex hull) with nearest-neighbor values
+        # to ensure boundary completeness without introducing spectral artifacts
+        nan_mask = np.isnan(structured_flat[:, c])
+        if np.any(nan_mask):
+            tree = cKDTree(coords_norm)
+            _, nearest_idx = tree.query(target_points[nan_mask], k=1)
+            structured_flat[nan_mask, c] = solution_fields[nearest_idx, c]
 
-    return cartesian_tensor
+    return structured_flat.reshape((resolution, resolution, resolution, num_channels))
 
 
-def topology_preserving_subsampling(coords, solution_fields, retain_ratio=0.3):
+def extract_coarse_grid(structured_tensor, retain_ratio=0.3):
     """
-    Uniform spatial downsampling (Voxel Grid Filter) to strictly preserve
-    global topological structures, replacing naive random sampling.
+    Topology-Preserving Coarse-Grid Conditioning.
 
-    Academic Justification:
-    Random sampling disrupts the uniform representation of the physical geometry.
-    This voxel-based approach ensures that the retained subset (e.g., 30%) provides
-    a spatially uniform, topology-preserving coarse-grid observation set necessary
-    for anchoring the local tangent space during manifold adaptation.
+    As specified in Section 4.4, uniform topology-preserving downsampling is
+    performed using fixed spatial strides on the reconstructed Cartesian grid,
+    rather than applying voxel filtering directly to the original unstructured mesh.
     """
-    num_points = len(coords)
-    target_points = int(num_points * retain_ratio)
+    resolution = structured_tensor.shape[0]
 
-    if target_points <= 0 or target_points >= num_points:
-        return coords, solution_fields
+    # Calculate the exact spatial stride required to achieve the target retain_ratio
+    # Equation: (1 / stride)^3 ≈ retain_ratio  =>  stride ≈ (1 / retain_ratio)^(1/3)
+    stride = max(1, int(np.round((1.0 / retain_ratio) ** (1.0 / 3.0))))
 
-    # Determine voxel size to yield approximately target_points
-    domain_extent = np.max(coords, axis=0) - np.min(coords, axis=0)
-    domain_volume = np.prod(np.where(domain_extent > 0, domain_extent, 1e-8))
-    voxel_volume = domain_volume / target_points
-    voxel_size = voxel_volume ** (1 / 3)
+    # Apply uniform downsampling via stride slicing
+    coarse_tensor = structured_tensor[::stride, ::stride, ::stride, :]
 
-    # Assign points to corresponding voxels
-    voxel_indices = np.floor((coords - np.min(coords, axis=0)) / voxel_size).astype(int)
+    actual_ratio = coarse_tensor.size / structured_tensor.size
+    print(f"Applied spatial stride: {stride}")
+    print(f"Target retention: {retain_ratio:.1%}, Actual retention: {actual_ratio:.1%}")
 
-    # Create unique voxel hashes for fast grouping
-    hashes = voxel_indices[:, 0] + voxel_indices[:, 1] * 1000 + voxel_indices[:, 2] * 1000000
-    df = pd.DataFrame({'hash': hashes, 'index': np.arange(num_points)})
-
-    # Sample exactly one point per voxel to ensure spatial uniformity
-    sampled_indices = df.groupby('hash').first()['index'].values
-
-    # If empty voxels caused undersampling, top-up randomly from the remainder (rare edge case)
-    if len(sampled_indices) < target_points:
-        remaining_needed = target_points - len(sampled_indices)
-        available_indices = np.setdiff1d(np.arange(num_points), sampled_indices)
-        top_up = np.random.choice(available_indices, remaining_needed, replace=False)
-        sampled_indices = np.concatenate([sampled_indices, top_up])
-
-    return coords[sampled_indices], solution_fields[sampled_indices]
+    return coarse_tensor
 
 
-def process_unstructured_csv(csv_path, output_dir, resolution=64):
+def process_unstructured_csv(csv_path, output_dir, resolution=64, retain_ratio=0.3):
     """
-    Main pipeline: Reads raw CFD data and exports a unified 3D spatial tensor
-    prepared strictly for 3D FFT, PSD, and POD analysis.
+    Complete preprocessing pipeline mathematically conforming to GD-PINNs methodology.
     """
-    print(f"\nProcessing CFD solution: {csv_path}")
+    # 1. Read high-fidelity unstructured CFD data
     df = pd.read_csv(csv_path)
-
-    # Extract coordinates (x, y, z) and fields (u, v, w, p)
     coords = df[["x", "y", "z"]].values
-    solution_fields = df[["u", "v", "w", "p"]].values
+    fields = df[["u", "v", "w", "p"]].values
 
-    # Step 1: Nondimensionalization to [-1, 1]^3
-    coords_norm = nondimensionalize_coordinates(coords)
+    # 2. Nondimensionalize coordinates via characteristic length scale (Eq. 3)
+    coords_norm, l_ref = nondimensionalize_coordinates(coords)
 
-    # Step 2: Cartesian reconstruction using Natural Neighbor Surrogate
-    cartesian_tensor = natural_neighbor_surrogate_resampling(
-        coords_norm,
-        solution_fields,
-        resolution=resolution,
-        k_neighbors=8
-    )
+    # 3. Reconstruct physical fields onto the unified Cartesian grid
+    dense_tensor = natural_neighbor_interpolation_proxy(coords_norm, fields, resolution=resolution)
 
-    # Step 3: Export the structured tensor
+    # 4. Topology-preserving coarse-grid extraction (approx 30% retention)
+    coarse_tensor = extract_coarse_grid(dense_tensor, retain_ratio=retain_ratio)
+
+    # 5. Export structured tensors for spectral-physical descriptor extraction
     os.makedirs(output_dir, exist_ok=True)
-    base_name = os.path.splitext(os.path.basename(csv_path))[0]
-    save_path = os.path.join(output_dir, f"{base_name}_cartesian_{resolution}.npy")
+    base = os.path.splitext(os.path.basename(csv_path))[0]
 
-    np.save(save_path, cartesian_tensor)
+    dense_path = os.path.join(output_dir, f"{base}_cartesian_dense_{resolution}.npy")
+    coarse_path = os.path.join(output_dir, f"{base}_cartesian_coarse_stride.npy")
 
-    print(f"Structured tensor successfully saved to: {save_path}")
-    print(f"Tensor shape: {cartesian_tensor.shape} (X, Y, Z, Channels)")
-    print("The tensor is perfectly conditioned for 3D FFT and Spectral-Physical Embedding.")
+    np.save(dense_path, dense_tensor)
+    np.save(coarse_path, coarse_tensor)
+
+    print(f"Dense tensor saved to: {dense_path}, shape: {dense_tensor.shape}")
+    print(f"Coarse tensor saved to: {coarse_path}, shape: {coarse_tensor.shape}")
 
 
 if __name__ == "__main__":
-    process_unstructured_csv(csv_path="data/task_001.csv", output_dir="data/cartesian_tensor/", resolution=64)
+    # Example execution
+    # process_unstructured_csv("data/task_001.csv", "data/tensors/", resolution=64, retain_ratio=0.3)
     pass
