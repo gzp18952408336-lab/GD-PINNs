@@ -181,6 +181,5 @@ def process_unstructured_csv(csv_path, output_dir, resolution=64):
 
 
 if __name__ == "__main__":
-    # Example usage:
-    # process_unstructured_csv(csv_path="data/task_001.csv", output_dir="data/cartesian_tensor/", resolution=64)
+    process_unstructured_csv(csv_path="data/task_001.csv", output_dir="data/cartesian_tensor/", resolution=64)
     pass
