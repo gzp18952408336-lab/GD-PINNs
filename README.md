@@ -1,30 +1,16 @@
-This repository contains the complete implementation used in the study, including
-model architectures, training procedures, loss formulations, and evaluation scripts.
-For ease of use and reproducibility, the full codebase has been packaged into a single
-self-contained file.
+GD-PINNs - Implementation Repository
+This repository contains the complete implementation used in the study, including model architectures, training procedures, loss formulations, and evaluation scripts. For ease of use and reproducibility, the full codebase has been packaged into a self-contained file structure.
 
-## Code Availability
+Code Overview
+The repository provides two primary components that together constitute the complete GD-PINNs implementation.
 
-The provided code includes all components required to reproduce the reported results,
-including data loading interfaces, network definitions, optimization routines, and
-post-processing utilities. Configuration files and scripts are documented within the
-code to facilitate adaptation to different parameter settings or PDE configurations.
+The first component is an independent interpolation module that demonstrates the natural-neighbor interpolation procedure used to reconstruct unstructured finite-element solutions onto a unified Cartesian grid. This module serves as a standalone illustration of the preprocessing pipeline, showing how physical fields are resampled from irregular meshes to structured tensors. It includes coordinate nondimensionalization following the characteristic length scale formulation, Delaunay-based barycentric interpolation as an engineering proxy for true natural-neighbor interpolation, and topology-preserving coarse-grid extraction via fixed spatial strides. This module is provided primarily to help users understand the interpolation mechanics and to facilitate adaptation to their own data formats. Users may modify the resolution, interpolation method, or coarse-grid retention ratio according to the specific requirements of their datasets.
 
-## Data Availability
+The second component is the complete GD-PINNs framework, which implements the full methodological pipeline described in the paper. This includes the SpectralPhysicalExtractor class for constructing compact 150-dimensional manifold coordinates from FFT, PSD, and POD descriptors computed on the reconstructed Cartesian tensors. The GraphManifoldConstructor builds the k-nearest neighbor graph on the solution manifold, trains a graph attention network for anisotropic diffusion, and implements adaptive anchor support set expansion with covariance-based convergence detection. The OperatorGeometryTransfer class manages the decoupled hot-start strategy with strict one-nearest-neighbor inheritance for the encoder and graph-weighted interpolation for the adapter. The GD_PINNs_Net defines the FiLM-conditioned architecture, and the training routine implements hybrid Adam and L-BFGS-B optimization with topology-preserving coarse-grid conditioning through voxel grid filtering.
 
-The datasets used in this study are not fully hosted in this repository for two reasons:
+Adapting to New Datasets
+The provided implementation is configured for the specific tasks reported in the study. For users applying GD-PINNs to their own PDE families or datasets, several modifications may be necessary. The interpolation resolution and coarse-grid retention ratio should be adjusted based on the spectral complexity and manifold curvature of the target problem, as discussed in Section 4.4 of the paper. The spectral-physical feature extraction may require tuning of the FFT low-frequency cutoff, PSD axis aggregation, or POD energy retention threshold depending on the dominant structures of the target solution family. The graph construction parameters including neighborhood size and attention heads can be optimized according to the density and continuity of the task manifold. The network width and depth, while set to 100 neurons in this implementation, may be scaled according to problem complexity and available computational resources.
 
-1. **Industrial confidentiality**: A portion of the data originates from industrial
-   applications and is subject to confidentiality and usage restrictions.
+Data Availability
+The datasets used in this study are not fully hosted in this repository for two reasons. First, a portion of the data originates from industrial seawater reverse osmosis applications and is subject to confidentiality and usage restrictions. Second, the full datasets are extremely large in size, making them unsuitable for hosting on standard code repositories. To support transparency and reproducibility, this repository includes representative small-scale example datasets that illustrate the data format, physical meaning, and usage within the code pipeline. These examples are sufficient to verify the correctness of the implementation and to reproduce representative results reported in the paper. The complete datasets are available from the corresponding author upon reasonable request.
 
-2. **Data scale**: The full datasets are extremely large in size, making them unsuitable
-   for hosting on standard code repositories.
-
-To support transparency and reproducibility, this repository includes a set of
-representative small-scale example datasets that illustrate the data format, physical
-meaning, and usage within the code pipeline. These examples are sufficient to verify
-the correctness of the implementation and to reproduce representative results reported
-in the paper.
-
-The complete datasets are available from the corresponding author upon reasonable
-request.
