@@ -6,18 +6,7 @@ from scipy.interpolate import LinearNDInterpolator
 
 
 def nondimensionalize_coordinates(coords, l_ref=None):
-    """
-    Nondimensionalize spatial coordinates strictly following Eq. 3 of GD-PINNs:
-    x* = x / x_ref.
-
-    Academic Note: If subsequent PINN optimization requires mapping coordinates
-    to a strictly symmetric domain (e.g., [-1, 1]^3) for gradient stability,
-    that affine translation should be handled inside the neural network's
-    input layer rather than conflated with the physical nondimensionalization
-    step defined in the manuscript.
-    """
     if l_ref is None:
-        # Define characteristic length scale as the maximum span across all dimensions
         coords_min = np.min(coords, axis=0)
         coords_max = np.max(coords, axis=0)
         l_ref = np.max(coords_max - coords_min)
@@ -26,104 +15,113 @@ def nondimensionalize_coordinates(coords, l_ref=None):
     return coords_norm, l_ref
 
 
-def natural_neighbor_interpolation_proxy(coords_norm, solution_fields, resolution=64):
+def natural_neighbor_interpolation_proxy(coords_norm, solution_fields, base_resolution=64):
     """
-    Resample unstructured fields onto a unified Cartesian grid.
+    Resample unstructured physical fields (u, v, w, p) onto an isotropic 3D Cartesian grid.
 
-    Academic Note: True 3D Natural-Neighbor (Sibson) interpolation provides C^1
-    continuity globally. Due to the lack of native 3D Sibson interpolation in
-    standard SciPy, this function employs Delaunay-based barycentric linear
-    interpolation (LinearNDInterpolator) as an engineering proxy. While it is
-    C^0 continuous, it effectively avoids spurious extrapolatory oscillations
-    and preserves the dominant transport organization required for FFT/PSD analysis.
     """
-    # Determine the bounding box for the normalized coordinates
     min_bounds = np.min(coords_norm, axis=0)
     max_bounds = np.max(coords_norm, axis=0)
+    spans = max_bounds - min_bounds
 
-    # Create a unified Cartesian grid bounding the physical domain
+    # Compute isotropic resolution per dimension based on spatial spans
+    max_span = np.max(spans)
+    res_x = max(8, int(np.round(base_resolution * (spans[0] / max_span))))
+    res_y = max(8, int(np.round(base_resolution * (spans[1] / max_span))))
+    res_z = max(8, int(np.round(base_resolution * (spans[2] / max_span))))
+
+    # Construct physical Cartesian grid
     grid_x, grid_y, grid_z = np.mgrid[
-                             min_bounds[0]:max_bounds[0]:resolution * 1j,
-                             min_bounds[1]:max_bounds[1]:resolution * 1j,
-                             min_bounds[2]:max_bounds[2]:resolution * 1j
+                             min_bounds[0]:max_bounds[0]:res_x * 1j,
+                             min_bounds[1]:max_bounds[1]:res_y * 1j,
+                             min_bounds[2]:max_bounds[2]:res_z * 1j
                              ]
     target_points = np.column_stack([grid_x.ravel(), grid_y.ravel(), grid_z.ravel()])
 
-    num_channels = solution_fields.shape[1]
-    structured_flat = np.zeros((target_points.shape[0], num_channels), dtype=np.float64)
+    # Pass entire multi-channel matrix directly to perform single-pass Delaunay triangulation
+    interpolator = LinearNDInterpolator(coords_norm, solution_fields)
+    structured_flat = interpolator(target_points)  # Shape: (N_target, num_channels)
 
-    for c in range(num_channels):
-        interpolator = LinearNDInterpolator(coords_norm, solution_fields[:, c])
-        structured_flat[:, c] = interpolator(target_points)
+    # Smooth boundary extension using k-NN Inverse Distance Weighting (IDW, k=4)
+    nan_mask = np.isnan(structured_flat[:, 0])
+    if np.any(nan_mask):
+        tree = cKDTree(coords_norm)
+        k_neighbors = 4
+        distances, nearest_idx = tree.query(target_points[nan_mask], k=k_neighbors)
 
-        # Replace NaNs (grid points outside the Delaunay convex hull) with nearest-neighbor values
-        # to ensure boundary completeness without introducing spectral artifacts
-        nan_mask = np.isnan(structured_flat[:, c])
-        if np.any(nan_mask):
-            tree = cKDTree(coords_norm)
-            _, nearest_idx = tree.query(target_points[nan_mask], k=1)
-            structured_flat[nan_mask, c] = solution_fields[nearest_idx, c]
+        # Avoid zero division on boundary
+        eps = 1e-10
+        weights = 1.0 / (distances + eps)
+        weights /= np.sum(weights, axis=1, keepdims=True)  # Shape: (N_nan, k)
 
-    return structured_flat.reshape((resolution, resolution, resolution, num_channels))
+        # Vectorized IDW weighting across all solution channels
+        extrapolated_vals = np.sum(solution_fields[nearest_idx] * weights[:, :, None], axis=1)
+        structured_flat[nan_mask] = extrapolated_vals
+
+    return structured_flat.reshape((res_x, res_y, res_z, -1))
 
 
 def extract_coarse_grid(structured_tensor, retain_ratio=0.3):
-    """
-    Topology-Preserving Coarse-Grid Conditioning.
+    res_x, res_y, res_z, num_channels = structured_tensor.shape
 
-    As specified in Section 4.4, uniform topology-preserving downsampling is
-    performed using fixed spatial strides on the reconstructed Cartesian grid,
-    rather than applying voxel filtering directly to the original unstructured mesh.
-    """
-    resolution = structured_tensor.shape[0]
+    # Scale factor per dimension: r_1d = retain_ratio^(1/3)
+    scale_1d = retain_ratio ** (1.0 / 3.0)
 
-    # Calculate the exact spatial stride required to achieve the target retain_ratio
-    # Equation: (1 / stride)^3 ≈ retain_ratio  =>  stride ≈ (1 / retain_ratio)^(1/3)
-    stride = max(1, int(np.round((1.0 / retain_ratio) ** (1.0 / 3.0))))
+    coarse_res_x = max(2, int(np.round(res_x * scale_1d)))
+    coarse_res_y = max(2, int(np.round(res_y * scale_1d)))
+    coarse_res_z = max(2, int(np.round(res_z * scale_1d)))
 
-    # Apply uniform downsampling via stride slicing
-    coarse_tensor = structured_tensor[::stride, ::stride, ::stride, :]
+    # Compute boundary-inclusive grid indices
+    idx_x = np.round(np.linspace(0, res_x - 1, coarse_res_x)).astype(int)
+    idx_y = np.round(np.linspace(0, res_y - 1, coarse_res_y)).astype(int)
+    idx_z = np.round(np.linspace(0, res_z - 1, coarse_res_z)).astype(int)
+
+    coarse_tensor = structured_tensor[np.ix_(idx_x, idx_y, idx_z)]
 
     actual_ratio = coarse_tensor.size / structured_tensor.size
-    print(f"Applied spatial stride: {stride}")
-    print(f"Target retention: {retain_ratio:.1%}, Actual retention: {actual_ratio:.1%}")
+    print(f"Dense Tensor Grid:  ({res_x}, {res_y}, {res_z})")
+    print(f"Coarse Tensor Grid: ({coarse_res_x}, {coarse_res_y}, {coarse_res_z})")
+    print(f"Target Retention: {retain_ratio:.1%}, Actual Retention: {actual_ratio:.1%}")
 
     return coarse_tensor
 
 
-def process_unstructured_csv(csv_path, output_dir, resolution=64, retain_ratio=0.3):
+def process_unstructured_csv(csv_path, output_dir, base_resolution=64, retain_ratio=0.3, l_ref=None):
     """
-    Complete preprocessing pipeline mathematically conforming to GD-PINNs methodology.
+    Complete end-to-end preprocessing pipeline conforming strictly to GD-PINNs methodology.
+
     """
     # 1. Read high-fidelity unstructured CFD data
     df = pd.read_csv(csv_path)
     coords = df[["x", "y", "z"]].values
     fields = df[["u", "v", "w", "p"]].values
 
-    # 2. Nondimensionalize coordinates via characteristic length scale (Eq. 3)
-    coords_norm, l_ref = nondimensionalize_coordinates(coords)
+    # 2. Non-dimensionalization strictly following Eq. 3: x* = x / l_ref
+    coords_norm, l_ref_used = nondimensionalize_coordinates(coords, l_ref=l_ref)
 
-    # 3. Reconstruct physical fields onto the unified Cartesian grid
-    dense_tensor = natural_neighbor_interpolation_proxy(coords_norm, fields, resolution=resolution)
+    # 3. Resample onto isotropic Cartesian grid with C^0 continuity & IDW smooth boundary
+    dense_tensor = natural_neighbor_interpolation_proxy(
+        coords_norm, fields, base_resolution=base_resolution
+    )
 
-    # 4. Topology-preserving coarse-grid extraction (approx 30% retention)
+    # 4. Extract topology-preserving coarse grid (~30% retention ratio)
     coarse_tensor = extract_coarse_grid(dense_tensor, retain_ratio=retain_ratio)
 
-    # 5. Export structured tensors for spectral-physical descriptor extraction
+    # 5. Export dense and coarse structured tensors
     os.makedirs(output_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(csv_path))[0]
 
-    dense_path = os.path.join(output_dir, f"{base}_cartesian_dense_{resolution}.npy")
-    coarse_path = os.path.join(output_dir, f"{base}_cartesian_coarse_stride.npy")
+    dense_path = os.path.join(output_dir, f"{base}_cartesian_dense.npy")
+    coarse_path = os.path.join(output_dir, f"{base}_cartesian_coarse.npy")
 
     np.save(dense_path, dense_tensor)
     np.save(coarse_path, coarse_tensor)
 
-    print(f"Dense tensor saved to: {dense_path}, shape: {dense_tensor.shape}")
-    print(f"Coarse tensor saved to: {coarse_path}, shape: {coarse_tensor.shape}")
+    print(f"Successfully processed: {base}")
+    print(f"  └─ Dense Tensor saved to:  {dense_path} | Shape: {dense_tensor.shape}")
+    print(f"  └─ Coarse Tensor saved to: {coarse_path} | Shape: {coarse_tensor.shape}\n")
 
 
 if __name__ == "__main__":
-    # Example execution
-    # process_unstructured_csv("data/task_001.csv", "data/tensors/", resolution=64, retain_ratio=0.3)
+    process_unstructured_csv("data/task_001.csv", "data/tensors/", base_resolution=64, retain_ratio=0.3, l_ref=0.001)
     pass
