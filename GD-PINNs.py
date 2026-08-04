@@ -246,39 +246,34 @@ class GraphManifoldConstructor:
         return np.arange(len(features))
 
     def select_next_task(self, trained_indices, remaining_indices):
-        """
-        Identifies the optimal subsequent transfer target based on
-        multi-hop topological radiation across the manifold.
-        """
-        influence = torch.zeros(len(self.embeddings), device=self.device)
-        influence[trained_indices] = 1.0
-
-        for _ in range(3):
-            influence = torch.matmul(self.dense_adj, influence)
-
-        best_idx = max(remaining_indices, key=lambda idx: influence[idx].item())
-        return best_idx
-
+            influence = torch.zeros(len(self.embeddings), device=self.device)
+            influence[trained_indices] = 1.0
+    
+            deg = torch.sum(self.dense_adj, dim=1, keepdim=True) + 1e-8
+            norm_adj = self.dense_adj / deg
+    
+            for _ in range(3):
+                influence = torch.matmul(norm_adj, influence)
+    
+            best_idx = max(remaining_indices, key=lambda idx: influence[idx].item())
+            return best_idx
+    
     def get_transfer_weights(self, target_idx, trained_indices, tau=0.1):
-        """
-        Determines the 1-NN task for strict operator inheritance and calculates
-        softmax-normalized graph-proximity weights for adapter interpolation.
-        """
         target_emb = self.embeddings[target_idx]
         candidate_embs = self.embeddings[trained_indices]
-
+    
         sims = F.cosine_similarity(target_emb.unsqueeze(0), candidate_embs)
-
+    
         k_actual = min(self.k_neighbors, len(trained_indices))
-        _, top_k = torch.topk(sims, k_actual)
+        top_sims, top_k = torch.topk(sims, k_actual)
+            
         neighbor_idx = [trained_indices[i] for i in top_k.cpu().numpy()]
-
-        neighbor_embs = self.embeddings[neighbor_idx]
-        logits = torch.matmul(neighbor_embs, target_emb) / tau
+            
+        logits = top_sims / tau
         weights = F.softmax(logits, dim=0).cpu().numpy()
-
+    
         nearest_idx = neighbor_idx[0]
-
+    
         return nearest_idx, neighbor_idx, weights
 
 
@@ -326,60 +321,54 @@ class GD_PINNs_Net(nn.Module):
         return self.adapter(modulated)
 
     def net_f_NS(self, x, h_graph, l_ref):
-        """
-        Evaluates Navier-Stokes physical residual constraints.
-        Enforces proper partial derivative scaling strictly according to the chain rule
-        dictated by spatial non-dimensionalization mappings.
-        """
-        x = x.clone().detach().requires_grad_(True)
-        uvwp = self.forward(x, h_graph)
-        u, v, w, p = uvwp[:, 0:1], uvwp[:, 1:2], uvwp[:, 2:3], uvwp[:, 3:4]
-
-        def grads(y):
-            return autograd.grad(y, x, torch.ones_like(y), create_graph=True)[0]
-
-        u_grads = grads(u)
-        v_grads = grads(v)
-        w_grads = grads(w)
-        p_grads = grads(p)
-
-        u_x = u_grads[:, 0:1] / l_ref
-        u_y = u_grads[:, 1:2] / l_ref
-        u_z = u_grads[:, 2:3] / l_ref
-
-        v_x = v_grads[:, 0:1] / l_ref
-        v_y = v_grads[:, 1:2] / l_ref
-        v_z = v_grads[:, 2:3] / l_ref
-
-        w_x = w_grads[:, 0:1] / l_ref
-        w_y = w_grads[:, 1:2] / l_ref
-        w_z = w_grads[:, 2:3] / l_ref
-
-        p_x = p_grads[:, 0:1] / l_ref
-        p_y = p_grads[:, 1:2] / l_ref
-        p_z = p_grads[:, 2:3] / l_ref
-
-        u_xx = grads(u_grads[:, 0:1])[:, 0:1] / (l_ref**2)
-        u_yy = grads(u_grads[:, 1:2])[:, 1:2] / (l_ref**2)
-        u_zz = grads(u_grads[:, 2:3])[:, 2:3] / (l_ref**2)
-
-        v_xx = grads(v_grads[:, 0:1])[:, 0:1] / (l_ref**2)
-        v_yy = grads(v_grads[:, 1:2])[:, 1:2] / (l_ref**2)
-        v_zz = grads(v_grads[:, 2:3])[:, 2:3] / (l_ref**2)
-
-        w_xx = grads(w_grads[:, 0:1])[:, 0:1] / (l_ref**2)
-        w_yy = grads(w_grads[:, 1:2])[:, 1:2] / (l_ref**2)
-        w_zz = grads(w_grads[:, 2:3])[:, 2:3] / (l_ref**2)
-
-        inv_Re = 1.0 / self.Re
-
-        f_e = u_x + v_y + w_z
-
-        f_u = u * u_x + v * u_y + w * u_z + p_x - inv_Re * (u_xx + u_yy + u_zz)
-        f_v = u * v_x + v * v_y + w * v_z + p_y - inv_Re * (v_xx + v_yy + v_zz)
-        f_w = u * w_x + v * w_y + w * w_z + p_z - inv_Re * (w_xx + w_yy + w_zz)
-
-        return uvwp, f_u, f_v, f_w, f_e
+            x = x.clone().detach().requires_grad_(True)
+            uvwp = self.forward(x, h_graph)
+            u, v, w, p = uvwp[:, 0:1], uvwp[:, 1:2], uvwp[:, 2:3], uvwp[:, 3:4]
+    
+            def grads(y, create_graph=True):
+                return autograd.grad(y, x, torch.ones_like(y), create_graph=create_graph, retain_graph=True)[0]
+    
+            u_grads = grads(u, create_graph=True)
+            v_grads = grads(v, create_graph=True)
+            w_grads = grads(w, create_graph=True)
+            p_grads = grads(p, create_graph=True)
+    
+            u_x = u_grads[:, 0:1] / l_ref
+            u_y = u_grads[:, 1:2] / l_ref
+            u_z = u_grads[:, 2:3] / l_ref
+    
+            v_x = v_grads[:, 0:1] / l_ref
+            v_y = v_grads[:, 1:2] / l_ref
+            v_z = v_grads[:, 2:3] / l_ref
+    
+            w_x = w_grads[:, 0:1] / l_ref
+            w_y = w_grads[:, 1:2] / l_ref
+            w_z = w_grads[:, 2:3] / l_ref
+    
+            p_x = p_grads[:, 0:1] / l_ref
+            p_y = p_grads[:, 1:2] / l_ref
+            p_z = p_grads[:, 2:3] / l_ref
+    
+            u_xx = grads(u_grads[:, 0:1], create_graph=False)[:, 0:1] / (l_ref**2)
+            u_yy = grads(u_grads[:, 1:2], create_graph=False)[:, 1:2] / (l_ref**2)
+            u_zz = grads(u_grads[:, 2:3], create_graph=False)[:, 2:3] / (l_ref**2)
+    
+            v_xx = grads(v_grads[:, 0:1], create_graph=False)[:, 0:1] / (l_ref**2)
+            v_yy = grads(v_grads[:, 1:2], create_graph=False)[:, 1:2] / (l_ref**2)
+            v_zz = grads(v_grads[:, 2:3], create_graph=False)[:, 2:3] / (l_ref**2)
+    
+            w_xx = grads(w_grads[:, 0:1], create_graph=False)[:, 0:1] / (l_ref**2)
+            w_yy = grads(w_grads[:, 1:2], create_graph=False)[:, 1:2] / (l_ref**2)
+            w_zz = grads(w_grads[:, 2:3], create_graph=False)[:, 2:3] / (l_ref**2)
+    
+            inv_Re = 1.0 / self.Re
+    
+            f_e = u_x + v_y + w_z
+            f_u = u * u_x + v * u_y + w * u_z + p_x - inv_Re * (u_xx + u_yy + u_zz)
+            f_v = u * v_x + v * v_y + w * v_z + p_y - inv_Re * (v_xx + v_yy + v_zz)
+            f_w = u * w_x + v * w_y + w * w_z + p_z - inv_Re * (w_xx + w_yy + w_zz)
+    
+            return uvwp, f_u, f_v, f_w, f_e
 
 
 class OperatorGeometryTransfer:
@@ -409,6 +398,7 @@ class OperatorGeometryTransfer:
                 target_state[k].copy_(fused)
 
         target_model.load_state_dict(target_state, strict=True)
+        return target_model
 
     def topology_preserving_subsample(self, coords, fields, retain_ratio=0.3):
         """
