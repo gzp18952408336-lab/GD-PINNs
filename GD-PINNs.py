@@ -399,7 +399,7 @@ class OperatorGeometryTransfer:
         target_state = target_model.state_dict()
 
         for k in target_state.keys():
-            if 'encoder' in k and k in source_state_1nn:
+            if ('encoder' in k or 'film_mlp' in k) and k in source_state_1nn:
                 target_state[k].copy_(source_state_1nn[k])
             elif 'adapter' in k:
                 fused = torch.zeros_like(target_state[k])
@@ -408,8 +408,7 @@ class OperatorGeometryTransfer:
                         fused += w * state[k]
                 target_state[k].copy_(fused)
 
-        target_model.load_state_dict(target_state, strict=False)
-        return target_model
+        target_model.load_state_dict(target_state, strict=True)
 
     def topology_preserving_subsample(self, coords, fields, retain_ratio=0.3):
         """
@@ -563,13 +562,15 @@ def main():
         task_ids[idx] = task_id
 
     features = np.array(features)
+    feat_mean = np.mean(features, axis=0)
+    feat_std = np.std(features, axis=0) + 1e-8
+    features_normalized = (features - feat_mean) / feat_std
 
     # ========================================================================
     # Stage 2: Adaptive Graph Initialization
     # ========================================================================
-    embeddings = graph_constructor.build_and_train_graph(features)
-    anchor_indices = graph_constructor.expand_anchor_set(features)
-
+    embeddings = graph_constructor.build_and_train_graph(features_normalized)
+    anchor_indices = graph_constructor.expand_anchor_set(features_normalized)
     # ========================================================================
     # Stage 3: Baseline Training for Anchor Support Set
     # ========================================================================
