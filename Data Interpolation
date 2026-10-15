@@ -1,127 +1,150 @@
-import os
+from __future__ import annotations
+
 import numpy as np
-import pandas as pd
-from scipy.spatial import cKDTree
 from scipy.interpolate import LinearNDInterpolator
+from scipy.spatial import Delaunay, QhullError, cKDTree
 
 
-def nondimensionalize_coordinates(coords, l_ref=None):
-    if l_ref is None:
-        coords_min = np.min(coords, axis=0)
-        coords_max = np.max(coords, axis=0)
-        l_ref = np.max(coords_max - coords_min)
+def _points(values: np.ndarray, name: str) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 3 or not len(values):
+        raise ValueError(f"{name} must have shape (N, 3), N >= 1.")
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} contains non-finite coordinates.")
+    return values
 
-    coords_norm = coords / l_ref
-    return coords_norm, l_ref
+
+def _query(tree: cKDTree, points: np.ndarray, k: int):
+    distances, indices = tree.query(points, k=k, workers=-1)
+    if k == 1:
+        distances, indices = distances[:, None], indices[:, None]
+    return distances, indices
 
 
-def natural_neighbor_interpolation_proxy(coords_norm, solution_fields, base_resolution=64):
+def _local_spacing(tree: cKDTree, points: np.ndarray, k: int, fallback: float):
+    distances, _ = _query(tree, points, min(k, len(points)))
+    spacing = distances[:, -1]
+    positive = spacing[spacing > 0]
+    floor = float(np.median(positive)) * 0.1 if len(positive) else fallback
+    return np.maximum(spacing, floor)
+
+
+def reconstruct_cartesian(
+    coords_ref: np.ndarray,
+    fields: np.ndarray,
+    resolution: int = 64,
+    k_neighbors: int = 4,
+    power: float = 1.0,
+    support_factor: float = 2.0,
+    geometry_coords: np.ndarray | None = None,
+    method: str = "linear_idw",
+    grid_mode: str = "reference",
+    minimum_axis_points: int = 8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Shared 3D linear interpolation with local IDW boundary extension.
+
+    Coordinates are already scaled by the caller. Only ``fields`` supplies labels;
+    optional geometry coordinates define the bounding box and point-cloud support.
+    This is a piecewise-linear proxy, not Sibson natural-neighbor interpolation.
     """
-    Resample unstructured physical fields (u, v, w, p) onto an isotropic 3D Cartesian grid.
+    coords = _points(coords_ref, "coords_ref")
+    fields = np.asarray(fields, dtype=np.float64)
+    if fields.ndim == 1:
+        fields = fields[:, None]
+    if fields.ndim != 2 or fields.shape[0] != len(coords) or fields.shape[1] < 1:
+        raise ValueError("fields must have shape (N, C), C >= 1.")
+    if not np.isfinite(fields).all():
+        raise ValueError("fields contains non-finite labels.")
+    if method not in ("linear_idw", "idw"):
+        raise ValueError("method must be 'linear_idw' or 'idw'.")
+    if grid_mode not in ("reference", "aspect"):
+        raise ValueError("grid_mode must be 'reference' or 'aspect'.")
+    if int(resolution) != resolution or resolution < 4:
+        raise ValueError("resolution must be an integer >= 4.")
+    if int(minimum_axis_points) != minimum_axis_points or minimum_axis_points < 2:
+        raise ValueError("minimum_axis_points must be an integer >= 2.")
+    if int(k_neighbors) != k_neighbors or k_neighbors < 1:
+        raise ValueError("k_neighbors must be an integer >= 1.")
+    if not np.isfinite([power, support_factor]).all() or power <= 0 or support_factor <= 0:
+        raise ValueError("power and support_factor must be finite and positive.")
 
-    """
-    min_bounds = np.min(coords_norm, axis=0)
-    max_bounds = np.max(coords_norm, axis=0)
-    spans = max_bounds - min_bounds
+    geometry = None if geometry_coords is None else _points(geometry_coords, "geometry_coords")
+    support_coords = coords if geometry is None else geometry
+    lower, upper = support_coords.min(axis=0), support_coords.max(axis=0)
+    if grid_mode == "reference":
+        axes = [np.linspace(-1.0, 1.0, int(resolution)) for _ in range(3)]
+    else:
+        spans = upper - lower
+        if np.any(spans <= 0):
+            raise ValueError("Aspect grid requires nonzero extent along all three axes.")
+        shape = np.maximum(minimum_axis_points, np.rint(resolution * spans / spans.max()).astype(int))
+        axes = [np.linspace(lo, hi, int(n)) for lo, hi, n in zip(lower, upper, shape)]
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1)
+    targets = grid.reshape(-1, 3)
+    shape = grid.shape[:3]
+    spacing = np.array([axis[1] - axis[0] for axis in axes])
+    grid_radius = float(np.linalg.norm(spacing) * 0.5)
+    eps = np.finfo(float).eps * max(1.0, np.abs(support_coords).max(), np.abs(targets).max()) * 32
 
-    # Compute isotropic resolution per dimension based on spatial spans
-    max_span = np.max(spans)
-    res_x = max(8, int(np.round(base_resolution * (spans[0] / max_span))))
-    res_y = max(8, int(np.round(base_resolution * (spans[1] / max_span))))
-    res_z = max(8, int(np.round(base_resolution * (spans[2] / max_span))))
+    tree = cKDTree(coords)
+    k = min(int(k_neighbors), len(coords))
+    distances, indices = _query(tree, targets, k)
+    local_spacing = _local_spacing(tree, coords, 5, grid_radius)
+    supported = distances[:, 0] <= np.maximum(support_factor * local_spacing[indices[:, 0]], grid_radius)
+    supported &= np.all((targets >= lower - eps) & (targets <= upper + eps), axis=1)
+    if geometry is not None:
+        geometry_tree = cKDTree(geometry)
+        geometry_spacing = _local_spacing(geometry_tree, geometry, 5, grid_radius)
+        gd, gi = _query(geometry_tree, targets, 1)
+        supported &= gd[:, 0] <= np.maximum(support_factor * geometry_spacing[gi[:, 0]], grid_radius)
+    # Point-cloud support excludes distant cells but cannot certify unresolved holes.
+    output = np.zeros((len(targets), fields.shape[1]), dtype=np.float64)
+    exact = supported & (distances[:, 0] <= eps)
+    linear_mask = np.zeros(len(targets), dtype=bool)
+    if method == "linear_idw":
+        try:
+            # All observations enter one triangulation shared by every channel.
+            triangulation = Delaunay(coords)
+            interpolator = LinearNDInterpolator(triangulation, fields, fill_value=np.nan)
+        except QhullError as error:
+            raise ValueError(
+                "3D Delaunay triangulation failed: the observed coordinates may be "
+                "too few, coplanar or degenerate. Inspect the cloud or explicitly "
+                "select method='idw'; no automatic method change was made."
+            ) from error
+        active = np.flatnonzero(supported)
+        if len(active):
+            interpolated = np.asarray(interpolator(targets[active])).reshape(len(active), fields.shape[1])
+            finite = np.isfinite(interpolated).all(axis=1)
+            linear_mask[active[finite]] = True
+            output[active[finite]] = interpolated[finite]
+        linear_mask |= exact
 
-    # Construct physical Cartesian grid
-    grid_x, grid_y, grid_z = np.mgrid[
-                             min_bounds[0]:max_bounds[0]:res_x * 1j,
-                             min_bounds[1]:max_bounds[1]:res_y * 1j,
-                             min_bounds[2]:max_bounds[2]:res_z * 1j
-                             ]
-    target_points = np.column_stack([grid_x.ravel(), grid_y.ravel(), grid_z.ravel()])
-
-    # Pass entire multi-channel matrix directly to perform single-pass Delaunay triangulation
-    interpolator = LinearNDInterpolator(coords_norm, solution_fields)
-    structured_flat = interpolator(target_points)  # Shape: (N_target, num_channels)
-
-    # Smooth boundary extension using k-NN Inverse Distance Weighting (IDW, k=4)
-    nan_mask = np.isnan(structured_flat[:, 0])
-    if np.any(nan_mask):
-        tree = cKDTree(coords_norm)
-        k_neighbors = 4
-        distances, nearest_idx = tree.query(target_points[nan_mask], k=k_neighbors)
-
-        # Avoid zero division on boundary
-        eps = 1e-10
-        weights = 1.0 / (distances + eps)
-        weights /= np.sum(weights, axis=1, keepdims=True)  # Shape: (N_nan, k)
-
-        # Vectorized IDW weighting across all solution channels
-        extrapolated_vals = np.sum(solution_fields[nearest_idx] * weights[:, :, None], axis=1)
-        structured_flat[nan_mask] = extrapolated_vals
-
-    return structured_flat.reshape((res_x, res_y, res_z, -1))
-
-
-def extract_coarse_grid(structured_tensor, retain_ratio=0.3):
-    res_x, res_y, res_z, num_channels = structured_tensor.shape
-
-    # Scale factor per dimension: r_1d = retain_ratio^(1/3)
-    scale_1d = retain_ratio ** (1.0 / 3.0)
-
-    coarse_res_x = max(2, int(np.round(res_x * scale_1d)))
-    coarse_res_y = max(2, int(np.round(res_y * scale_1d)))
-    coarse_res_z = max(2, int(np.round(res_z * scale_1d)))
-
-    # Compute boundary-inclusive grid indices
-    idx_x = np.round(np.linspace(0, res_x - 1, coarse_res_x)).astype(int)
-    idx_y = np.round(np.linspace(0, res_y - 1, coarse_res_y)).astype(int)
-    idx_z = np.round(np.linspace(0, res_z - 1, coarse_res_z)).astype(int)
-
-    coarse_tensor = structured_tensor[np.ix_(idx_x, idx_y, idx_z)]
-
-    actual_ratio = coarse_tensor.size / structured_tensor.size
-    print(f"Dense Tensor Grid:  ({res_x}, {res_y}, {res_z})")
-    print(f"Coarse Tensor Grid: ({coarse_res_x}, {coarse_res_y}, {coarse_res_z})")
-    print(f"Target Retention: {retain_ratio:.1%}, Actual Retention: {actual_ratio:.1%}")
-
-    return coarse_tensor
-
-
-def process_unstructured_csv(csv_path, output_dir, base_resolution=64, retain_ratio=0.3, l_ref=None):
-    """
-    Complete end-to-end preprocessing pipeline conforming strictly to GD-PINNs methodology.
-
-    """
-    # 1. Read high-fidelity unstructured CFD data
-    df = pd.read_csv(csv_path)
-    coords = df[["x", "y", "z"]].values
-    fields = df[["u", "v", "w", "p"]].values
-
-    # 2. Non-dimensionalization strictly following Eq. 3: x* = x / l_ref
-    coords_norm, l_ref_used = nondimensionalize_coordinates(coords, l_ref=l_ref)
-
-    # 3. Resample onto isotropic Cartesian grid with C^0 continuity & IDW smooth boundary
-    dense_tensor = natural_neighbor_interpolation_proxy(
-        coords_norm, fields, base_resolution=base_resolution
-    )
-
-    # 4. Extract topology-preserving coarse grid (~30% retention ratio)
-    coarse_tensor = extract_coarse_grid(dense_tensor, retain_ratio=retain_ratio)
-
-    # 5. Export dense and coarse structured tensors
-    os.makedirs(output_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(csv_path))[0]
-
-    dense_path = os.path.join(output_dir, f"{base}_cartesian_dense.npy")
-    coarse_path = os.path.join(output_dir, f"{base}_cartesian_coarse.npy")
-
-    np.save(dense_path, dense_tensor)
-    np.save(coarse_path, coarse_tensor)
-
-    print(f"Successfully processed: {base}")
-    print(f"  └─ Dense Tensor saved to:  {dense_path} | Shape: {dense_tensor.shape}")
-    print(f"  └─ Coarse Tensor saved to: {coarse_path} | Shape: {coarse_tensor.shape}\n")
-
-
-if __name__ == "__main__":
-    process_unstructured_csv("data/task_001.csv", "data/tensors/", base_resolution=64, retain_ratio=0.3, l_ref=0.001)
-    pass
+    idw_mask = supported & ~linear_mask
+    ordinary = idw_mask & ~exact
+    if ordinary.any():
+        d = distances[ordinary]
+        # The ratio form avoids overflow when the nearest observation is very close.
+        weights = (d[:, :1] / d) ** power
+        weights /= weights.sum(axis=1, keepdims=True)
+        output[ordinary] = np.sum(fields[indices[ordinary]] * weights[..., None], axis=1)
+    output[exact] = fields[indices[exact, 0]]
+    output[~supported] = 0.0
+    info = {
+        "method": method,
+        "grid_mode": grid_mode,
+        "linear_count": int(linear_mask.sum()),
+        "idw_count": int(idw_mask.sum()),
+        "exact_count": int(exact.sum()),
+        "unsupported_count": int((~supported).sum()),
+        "observation_count": len(coords),
+        "triangulation_point_count": len(coords) if method == "linear_idw" else 0,
+        "geometry_point_count": len(support_coords),
+        "grid_shape": list(shape),
+        "spacing": spacing.tolist(),
+        "k_neighbors": k,
+        "power": float(power),
+        "support_factor": float(support_factor),
+        "support_mask": "local point-cloud distance and bounds; unresolved holes are not certified",
+    }
+    return grid, output.reshape(*shape, fields.shape[1]), supported.reshape(shape), info
